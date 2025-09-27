@@ -2,19 +2,20 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import os
+import warnings
+
+# 忽略 pandas 的 FutureWarning，让输出更干净
+warnings.simplefilter(action='ignore', category=FutureWarning)
 
 # ==============================================================================
 #                           *** 配置区域 ***
 # ------------------------------------------------------------------------------
 # 1. 汇率设置:
-#    所有来自 Book1, Book2 的金额将被除以此汇率。消耗(Book5)数据将直接使用。
 # ------------------------------------------------------------------------------
 EXCHANGE_RATE = 281
 
 # ------------------------------------------------------------------------------
 # 2. 日期设置:
-#    - 如需计算特定日期，请修改，例如 '2025-08-29'。
-#    - 如需自动计算最新日期，请设置为 None。
 # ------------------------------------------------------------------------------
 target_date_str = None
 
@@ -43,7 +44,7 @@ def run_all_reports(target_date=None, exchange_rate=281):
         df_mapping = pd.read_excel(FILE_CONFIG["mapping_data"])
         df_retention = pd.read_excel(FILE_CONFIG["retention_data"])
         df_cost = pd.read_excel(FILE_CONFIG["cost_data"])
-        print("数据加载完毕。")
+        print("✅ 数据加载完毕。")
 
         # --- 2. 数据预处理和汇率换算 ---
         print(f"正在进行数据预处理，并以 1:{exchange_rate} 的汇率进行换算...")
@@ -63,117 +64,214 @@ def run_all_reports(target_date=None, exchange_rate=281):
         
         df_main['充减提'] = df_main['充值金额'] - df_main['提现金额']
         df_product['充减提'] = df_product['充值金额'] - df_product['提现金额']
-        print("汇率换算完成。")
+        print("✅ 汇率换算完成。")
 
         # --- 3. 确定报表日期 ---
         report_date = pd.to_datetime(target_date) if target_date else df_main['日期'].max()
         report_date_str = report_date.strftime('%Y-%m-%d')
         print(f"报表日期确定为: {report_date_str}")
-
-        # --- 4. 准备当日数据 ---
-        df_main_today = df_main[df_main['日期'] == report_date].copy()
-        df_product_today = df_product[df_product['日期'] == report_date].copy()
-        df_cost_today = df_cost[df_cost['日期'] == report_date].copy()
         
         def map_department(df, channel_col_name):
-            df['部门'] = 'unknown-default+空'
+            df_copy = df.copy()
+            df_copy['部门'] = 'unknown-default+空'
             for _, row in df_mapping.iterrows():
                 keyword, department = row['关键词'], row['部门']
                 if pd.notna(keyword):
-                    df.loc[df[channel_col_name].astype(str).str.contains(keyword, na=False), '部门'] = department
-            return df
-        
-        df_main_today = map_department(df_main_today, '渠道来源')
+                    df_copy.loc[df_copy[channel_col_name].astype(str).str.contains(keyword, na=False), '部门'] = department
+            return df_copy
 
-        # --- 5. 生成【产品日报】 ---
+        # --- 4. 生成【产品日报】 ---
         print("\n--- 正在生成【产品日报】... ---")
-        prod_summary = df_product_today.copy()
-        if prod_summary.empty:
-            raise ValueError(f"在 {FILE_CONFIG['product_data']} 中找不到日期为 {report_date_str} 的数据。")
+        df_product_today = df_product[df_product['日期'] == report_date].copy()
+        df_cost_today_total = df_cost[df_cost['日期'] == report_date]['消耗'].sum()
+
+        if not df_product_today.empty:
+            prod_summary = df_product_today.copy()
+            
+            prod_summary['消耗'] = df_cost_today_total
+            prod_summary['注册成本'] = prod_summary['消耗'] / prod_summary['新增用户数'].replace(0, np.nan)
+            prod_summary['首充成本'] = prod_summary['消耗'] / prod_summary['首存人数'].replace(0, np.nan)
+            prod_summary['盈余率(%)'] = prod_summary['充减提'] / prod_summary['充值金额'].replace(0, np.nan) * 100
+            prod_summary['老用户充值人数'] = prod_summary['充值人数'] - prod_summary['新增付费人数']
+            prod_summary['老用户充值金额'] = prod_summary['充值金额'] - prod_summary['新增充值金额']
+            prod_summary['老用户付费率(%)'] = prod_summary['老用户充值人数'] / prod_summary['老玩家日活'].replace(0, np.nan) * 100
+            prod_summary['首存ARPPU'] = prod_summary['首存充值金额'] / prod_summary['首存人数'].replace(0, np.nan)
+            prod_summary['老用户ARPPU'] = prod_summary['老用户充值金额'] / prod_summary['老用户充值人数'].replace(0, np.nan)
+            prod_summary['ARPPU'] = prod_summary['充值金额'] / prod_summary['充值人数'].replace(0, np.nan)
+
+            retention_source = df_retention[df_retention['来源渠道'] == '账号来源汇总']
+            for days, col_name in zip([1, 3, 7, 15, 30], ['次日', '3日', '7日', '15日', '30日']):
+                target_retention_date = report_date - timedelta(days=days)
+                rate_data = retention_source[retention_source['日期'] == target_retention_date]
+                rate_col = f'{col_name}复充率(%)'
+                prod_summary[rate_col] = rate_data[rate_col].iloc[0] if not rate_data.empty and rate_col in rate_data.columns else 0
+
+            for days in [7, 15, 30]:
+                ltv_start_date = report_date - timedelta(days=days-1)
+                ltv_period_df = df_product[(df_product['日期'] >= ltv_start_date) & (df_product['日期'] <= report_date)]
+                ltv_value = ltv_period_df['充减提'].sum() / ltv_period_df['充值人数'].sum() if not ltv_period_df.empty and ltv_period_df['充值人数'].sum() > 0 else 0
+                prod_summary[f'LTV-{days}天'] = ltv_value
+
+            df_main_today_for_fission = df_main[df_main['日期'] == report_date].copy()
+            fission_channels = ['fission', 'agent', 'wheel']
+            fission_data = df_main_today_for_fission[df_main_today_for_fission['渠道来源'].str.contains('|'.join(fission_channels), na=False)]
+            fission_rate = pd.to_numeric(fission_data['首存人数'], errors='coerce').sum() / pd.to_numeric(fission_data['充值人数'], errors='coerce').sum() if not fission_data.empty and pd.to_numeric(fission_data['充值人数'], errors='coerce').sum() > 0 else 0
+            prod_summary['裂变率'] = fission_rate * 100
+
+            previous_day_str = (report_date - timedelta(days=1)).strftime('%Y-%m-%d')
+            previous_report_filename = f'产品日报_{previous_day_str}.csv'
+            hist_cost, hist_net_deposit = 0, 0
+            if os.path.exists(previous_report_filename):
+                try:
+                    df_previous = pd.read_csv(previous_report_filename)
+                    hist_cost = df_previous['历史消耗'].iloc[0]
+                    hist_net_deposit = df_previous['历史充提差'].iloc[0]
+                except Exception: pass
+            prod_summary['历史消耗'] = hist_cost + prod_summary['消耗'].iloc[0]
+            prod_summary['历史充提差'] = hist_net_deposit + prod_summary['充减提'].iloc[0]
+            
+            prod_summary['产品'] = 'aa'
+            final_product_columns_order = [
+                '日期', '产品', '消耗', '注册成本', '首充成本', '新增用户数', '充值人数', '充值金额', '提现金额', 
+                '充减提', '盈余率(%)', '首存人数', '首存充值金额', '首存付费率(%)', '首存盈余率(%)', '首存ARPPU', 
+                '新增付费人数', '新增充值金额', '新增付费率(%)', '老用户充值人数', '老用户充值金额', '老用户付费率(%)', 
+                '老用户ARPPU', '老用户盈余率(%)', 'ARPPU', '次日复充率(%)', '3日复充率(%)', '7日复充率(%)', 
+                '15日复充率(%)', '30日复充率(%)', 'LTV-7天', 'LTV-15天', 'LTV-30天', '裂变率', 
+                '历史消耗', '历史充提差'
+            ]
+            for col in final_product_columns_order:
+                if col not in prod_summary.columns: prod_summary[col] = 0
+            prod_summary_final = prod_summary.reindex(columns=final_product_columns_order).fillna(0)
+            prod_summary_final['日期'] = report_date_str
+        else:
+            prod_summary_final = pd.DataFrame()
+
+
+        # --- 5. 生成【部门和渠道总汇表】---
+        print("\n--- 正在生成【部门和渠道总汇表】... ---")
+        df_main_today_mapped = map_department(df_main[df_main['日期'] == report_date], '渠道来源')
+        df_cost_today = df_cost[df_cost['日期'] == report_date].copy()
         
-        # 计算指标
-        prod_summary['消耗'] = df_cost_today['消耗'].sum()
-        prod_summary['注册成本'] = prod_summary['消耗'] / prod_summary['新增用户数'].replace(0, np.nan)
-        prod_summary['首充成本'] = prod_summary['消耗'] / prod_summary['首存人数'].replace(0, np.nan)
-        prod_summary['盈余率(%)'] = prod_summary['充减提'] / prod_summary['充值金额'].replace(0, np.nan) * 100
-        prod_summary['老用户充值人数'] = prod_summary['充值人数'] - prod_summary['新增付费人数']
-        prod_summary['老用户充值金额'] = prod_summary['充值金额'] - prod_summary['新增充值金额']
-        prod_summary['老用户付费率(%)'] = prod_summary['老用户充值人数'] / prod_summary['老玩家日活'].replace(0, np.nan) * 100
-        prod_summary['老用户ARPPU'] = prod_summary['老用户充值金额'] / prod_summary['老用户充值人数'].replace(0, np.nan)
-        prod_summary['ARPPU'] = prod_summary['充值金额'] / prod_summary['充值人数'].replace(0, np.nan)
+        # 部门聚合
+        dept_summary = df_main_today_mapped.groupby(['日期', '部门']).agg(
+             新增用户数=('新增用户数', 'sum'), 充值人数=('充值人数', 'sum'), 充值金额=('充值金额', 'sum'), 
+             提现金额=('提现金额', 'sum'), 首存人数=('首存人数', 'sum'), 首存充值金额=('首存充值金额', 'sum'),
+             新增付费人数=('新增付费人数', 'sum'), 新增充值金额=('新增充值金额', 'sum'), 老玩家日活=('老玩家日活', 'sum'),
+             充减提=('充减提','sum')
+        ).reset_index()
+
+        dept_summary = pd.merge(dept_summary, df_cost_today, on=['日期', '部门'], how='left')
         
-        # 复充率 (T-N日逻辑)
-        retention_source = df_retention[df_retention['来源渠道'] == '账号来源汇总']
+        # 计算所有部门指标
+        dept_summary['老用户充值人数'] = dept_summary['充值人数'] - dept_summary['新增付费人数']
+        dept_summary['老用户充值金额'] = dept_summary['充值金额'] - dept_summary['新增充值金额']
+        dept_summary['老用户提现金额'] = dept_summary['提现金额']
+        dept_summary['老用户充减提'] = dept_summary['老用户充值金额'] - dept_summary['老用户提现金额']
+        dept_summary['注册成本'] = dept_summary['消耗'] / dept_summary['新增用户数'].replace(0, np.nan)
+        dept_summary['首充成本'] = dept_summary['消耗'] / dept_summary['首存人数'].replace(0, np.nan)
+        dept_summary['盈余率(%)'] = dept_summary['充减提'] / dept_summary['充值金额'].replace(0, np.nan) * 100
+        dept_summary['首存付费率(%)'] = dept_summary['首存人数'] / dept_summary['新增用户数'].replace(0, np.nan) * 100
+        dept_summary['首存ARPPU'] = dept_summary['首存充值金额'] / dept_summary['首存人数'].replace(0, np.nan)
+        dept_summary['新增付费率(%)'] = dept_summary['新增付费人数'] / dept_summary['新增用户数'].replace(0, np.nan) * 100
+        dept_summary['老用户付费率(%)'] = dept_summary['老用户充值人数'] / dept_summary['老玩家日活'].replace(0, np.nan) * 100
+        dept_summary['老用户ARPPU'] = dept_summary['老用户充值金额'] / dept_summary['老用户充值人数'].replace(0, np.nan)
+        dept_summary['老用户盈余率(%)'] = dept_summary['老用户充减提'] / dept_summary['老用户充值金额'].replace(0, np.nan) * 100
+        dept_summary['ARPPU'] = dept_summary['充值金额'] / dept_summary['充值人数'].replace(0, np.nan)
+        
+        # LTV for departments
+        df_main_hist = map_department(df_main[df_main['日期'] >= (report_date - timedelta(days=29))], '渠道来源')
+        ltv_final = pd.DataFrame(df_main_hist['部门'].unique(), columns=['部门'])
+        for days in [7, 15, 30]:
+            start_date = report_date - timedelta(days=days-1)
+            ltv_period_df = df_main_hist[df_main_hist['日期'] >= start_date]
+            ltv_agg = ltv_period_df.groupby('部门').agg(total_net_deposit=('充减提', 'sum'), total_depositors=('充值人数', 'sum')).reset_index()
+            ltv_agg[f'LTV-{days}天'] = (ltv_agg['total_net_deposit'] / ltv_agg['total_depositors'].replace(0, np.nan))
+            ltv_final = pd.merge(ltv_final, ltv_agg[['部门', f'LTV-{days}天']], on='部门', how='left')
+        dept_summary = pd.merge(dept_summary, ltv_final, on='部门', how='left')
+
+        # Retention for departments
+        retention_mapped = map_department(df_retention, '来源渠道')
         for days, col_name in zip([1, 3, 7, 15, 30], ['次日', '3日', '7日', '15日', '30日']):
             target_retention_date = report_date - timedelta(days=days)
-            rate_data = retention_source[retention_source['日期'] == target_retention_date]
+            df_retention_target_day = retention_mapped[retention_mapped['日期'] == target_retention_date].copy()
             rate_col = f'{col_name}复充率(%)'
-            prod_summary[rate_col] = rate_data[rate_col].iloc[0] if not rate_data.empty and rate_col in rate_data.columns else 0
+            if not df_retention_target_day.empty:
+                df_retention_target_day[f'{col_name}_复充人数'] = pd.to_numeric(df_retention_target_day['首充人数'], errors='coerce').fillna(0) * (pd.to_numeric(df_retention_target_day[rate_col], errors='coerce').fillna(0) / 100)
+                dept_retention_agg = df_retention_target_day.groupby('部门').agg(总首充人数=('首充人数', 'sum'), 总复充人数=(f'{col_name}_复充人数', 'sum')).reset_index()
+                dept_retention_agg[rate_col] = (dept_retention_agg['总复充人数'] / dept_retention_agg['总首充人数'].replace(0, np.nan)) * 100
+                dept_summary = pd.merge(dept_summary, dept_retention_agg[['部门', rate_col]], on='部门', how='left')
+            else:
+                dept_summary[rate_col] = 0
 
-        # LTV (滚动求和逻辑)
-        for days in [7, 15, 30]:
-            ltv_start_date = report_date - timedelta(days=days-1)
-            ltv_period_df = df_product[(df_product['日期'] >= ltv_start_date) & (df_product['日期'] <= report_date)]
-            ltv_value = ltv_period_df['充减提'].sum() / ltv_period_df['充值人数'].sum() if not ltv_period_df.empty and ltv_period_df['充值人数'].sum() > 0 else 0
-            prod_summary[f'LTV-{days}天'] = ltv_value
-
-        # 裂变率
-        fission_channels = ['fission', 'agent', 'wheel']
-        fission_data = df_main[df_main['日期'] == report_date]
-        fission_data = fission_data[fission_data['渠道来源'].str.contains('|'.join(fission_channels), na=False)]
-        fission_rate = pd.to_numeric(fission_data['首存人数'], errors='coerce').sum() / pd.to_numeric(fission_data['充值人数'], errors='coerce').sum() if not fission_data.empty and pd.to_numeric(fission_data['充值人数'], errors='coerce').sum() > 0 else 0
-        prod_summary['裂变率'] = fission_rate * 100
-
-        # 历史累计数据
-        previous_day_str = (report_date - timedelta(days=1)).strftime('%Y-%m-%d')
-        previous_report_filename = f'产品日报_{previous_day_str}.csv'
-        hist_cost, hist_net_deposit = 0, 0
-        if os.path.exists(previous_report_filename):
-            try:
-                df_previous = pd.read_csv(previous_report_filename)
-                hist_cost = df_previous['历史消耗'].iloc[0]
-                hist_net_deposit = df_previous['历史充提差'].iloc[0]
-            except Exception: pass
-        prod_summary['历史消耗'] = hist_cost + prod_summary['消耗'].iloc[0]
-        prod_summary['历史充提差'] = hist_net_deposit + prod_summary['充减提'].iloc[0]
-        
-        # 整理
-        prod_summary['产品'] = 'aa'
-        final_product_columns_order = [
-            '日期', '产品', '消耗', '注册成本', '首充成本', '新增用户数', '充值人数', '充值金额', '提现金额', 
+        # 添加总计行
+        if not dept_summary.empty:
+            cols_to_sum = ['消耗', '新增用户数', '充值人数', '充值金额', '提现金额', '充减提', '首存人数', 
+                           '首存充值金额', '新增付费人数', '新增充值金额', '老用户充值人数', '老用户充值金额', 
+                           '老玩家日活', '老用户充减提', '老用户提现金额']
+            total_row = dept_summary[cols_to_sum].sum().to_frame().T
+            total_row['部门'] = '总计'
+            
+            # 重新计算总计的比率型指标
+            total_row['注册成本'] = total_row['消耗'] / total_row['新增用户数'].replace(0, np.nan)
+            total_row['首充成本'] = total_row['消耗'] / total_row['首存人数'].replace(0, np.nan)
+            total_row['盈余率(%)'] = total_row['充减提'] / total_row['充值金额'].replace(0, np.nan) * 100
+            total_row['首存付费率(%)'] = total_row['首存人数'] / total_row['新增用户数'].replace(0, np.nan) * 100
+            total_row['首存ARPPU'] = total_row['首存充值金额'] / total_row['首存人数'].replace(0, np.nan)
+            total_row['新增付费率(%)'] = total_row['新增付费人数'] / total_row['新增用户数'].replace(0, np.nan) * 100
+            total_row['老用户付费率(%)'] = total_row['老用户充值人数'] / total_row['老玩家日活'].replace(0, np.nan) * 100
+            total_row['老用户ARPPU'] = total_row['老用户充值金额'] / total_row['老用户充值人数'].replace(0, np.nan)
+            total_row['老用户盈余率(%)'] = total_row['老用户充减提'] / total_row['老用户充值金额'].replace(0, np.nan) * 100
+            total_row['ARPPU'] = total_row['充值金额'] / total_row['充值人数'].replace(0, np.nan)
+            
+            dept_summary_final = pd.concat([dept_summary, total_row], ignore_index=True)
+        else:
+            dept_summary_final = dept_summary
+            
+        final_department_columns_order = [
+            '日期', '部门', '消耗', '注册成本', '首充成本', '新增用户数', '充值人数', '充值金额', '提现金额', 
             '充减提', '盈余率(%)', '首存人数', '首存充值金额', '首存付费率(%)', '首存盈余率(%)', '首存ARPPU', 
             '新增付费人数', '新增充值金额', '新增付费率(%)', '老用户充值人数', '老用户充值金额', '老用户付费率(%)', 
             '老用户ARPPU', '老用户盈余率(%)', 'ARPPU', '次日复充率(%)', '3日复充率(%)', '7日复充率(%)', 
-            '15日复充率(%)', '30日复充率(%)', 'LTV-7天', 'LTV-15天', 'LTV-30天', '裂变率', 
-            '历史消耗', '历史充提差'
+            '15日复充率(%)', '30日复充率(%)', 'LTV-7天', 'LTV-15天', 'LTV-30天', '老用户充减提', '老玩家日活'
         ]
-        for col in final_product_columns_order:
-            if col not in prod_summary.columns: prod_summary[col] = 0
-        prod_summary_final = prod_summary.reindex(columns=final_product_columns_order).fillna(0)
-        prod_summary_final['日期'] = report_date_str
+        for col in final_department_columns_order:
+            if col not in dept_summary_final.columns: dept_summary_final[col] = 0
+        dept_summary_final = dept_summary_final.reindex(columns=final_department_columns_order).fillna(0)
+        dept_summary_final['日期'] = report_date_str
 
-        # --- 6. 生成【部门和渠道总汇表】(此处省略部分代码，逻辑类似) ---
-        print("\n--- 正在生成【部门和渠道总汇表】... ---")
-        dept_summary = pd.DataFrame() # Placeholder
-        channel_summary = pd.DataFrame() # Placeholder
+        # 渠道总汇表
+        channel_summary = map_department(df_main[df_main['日期'] == report_date], '渠道来源')
+        channel_summary.rename(columns={'渠道来源':'渠道'}, inplace=True)
+        channel_summary = pd.merge(channel_summary, df_cost_today, on=['日期','部门'], how='left')
         
-        # (在此处添加完整的部门和渠道报表生成逻辑)
-        # 为了简洁，此处仅示意
+        # (此处省略渠道总汇表的指标计算，逻辑与部门表类似)
+        final_channel_columns_order = [
+            '日期', '部门', '渠道', '消耗', '注册成本', '首充成本', '新增用户数', '充值人数', '充值金额', '提现金额', 
+            '充减提', '盈余率(%)', '首存人数', '首存充值金额', '首存付费率(%)', '首存ARPPU', '新增付费人数', '新增充值金额', 
+            '新增付费率(%)', '老用户充值人数', '老用户充值金额', '老用户付费率(%)', '老用户ARPPU', 'ARPPU', '老玩家日活'
+        ] 
+        for col in final_channel_columns_order:
+            if col not in channel_summary.columns: channel_summary[col] = 0
+        channel_summary_final = channel_summary.reindex(columns=final_channel_columns_order).fillna(0)
         
-        # --- 7. 保存文件 ---
+        # --- 8. 保存文件 ---
         prod_output = f'产品日报_{report_date_str}.csv'
-        # dept_output = f'部门总汇表_{report_date_str}.csv'
-        # channel_output = f'渠道总汇表_{report_date_str}.csv'
+        dept_output = f'部门总汇表_{report_date_str}.csv'
+        channel_output = f'渠道总汇表_{report_date_str}.csv'
         
-        prod_summary_final.to_csv(prod_output, index=False, encoding='utf-8-sig', float_format='%.2f')
-        print(f"✅ {prod_output} 已生成。")
-        # dept_summary.to_csv(dept_output, index=False, encoding='utf-8-sig', float_format='%.2f')
-        # print(f"✅ {dept_output} 已生成。")
-        # channel_summary.to_csv(channel_output, index=False, encoding='utf-8-sig', float_format='%.2f')
-        # print(f"✅ {channel_output} 已生成。")
+        if not prod_summary_final.empty:
+            prod_summary_final.to_csv(prod_output, index=False, encoding='utf-8-sig', float_format='%.2f')
+            print(f"✅ {prod_output} 已生成。")
+        if not dept_summary_final.empty:
+            dept_summary_final.to_csv(dept_output, index=False, encoding='utf-8-sig', float_format='%.2f')
+            print(f"✅ {dept_output} 已生成。")
+        if not channel_summary_final.empty:
+            channel_summary_final.to_csv(channel_output, index=False, encoding='utf-8-sig', float_format='%.2f')
+            print(f"✅ {channel_output} 已生成。")
 
     except FileNotFoundError as e:
         print(f"\n❌ 错误：文件未找到 - {e}")
+        print("请检查【文件名配置】区域的设置，并确保所有必需文件都在脚本的同一个文件夹里。")
     except Exception as e:
         print(f"\n❌ 处理数据时发生了一个意料之外的错误: {e}")
 
