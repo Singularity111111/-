@@ -136,7 +136,6 @@ def get_recharge_rates_by_dept(df_recharge_rate, departments, df_dept_map, repor
     print("--- 正在按部门独立计算复充率 (加权平均) ---")
     all_results = []
     
-    # ⭐️ 核心修正：明确定义回溯天数，避免 '次日' 导致的错误
     rate_map = {'次日复充率(%)': 1, '3日复充率(%)': 3, '7日复充率(%)': 7, '15日复充率(%)': 15, '30日复充率(%)': 30}
     rate_keys = list(rate_map.keys())
     
