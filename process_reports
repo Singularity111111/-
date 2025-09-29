@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-数据分析日报自动生成脚本 (功能完整 | 全字段输出 | LTV归因修正 | ARPPU修正 | 最终版)
+数据分析日报自动生成脚本 (功能完整 | 全字段输出 | LTV归因修正 | ARPPU及盈余率修正 | 最终版)
 """
 import pandas as pd
 import numpy as np
@@ -27,7 +27,7 @@ OTHER_REPORTS_DECIMALS = 2
 
 
 def load_and_prepare_data():
-    """加载所有Excel文件并进行预处理，强制转换数据类型以确保健壮性。"""
+    """加载所有Excel文件并进行预处理，强制重新计算聚合字段以确保逻辑一致性。"""
     print("\n开始加载和预处理数据...")
     try:
         df_channel = pd.read_excel(FILE_BOOK1)
@@ -41,11 +41,19 @@ def load_and_prepare_data():
             df.columns = df.columns.str.strip()
         print("  ✓ 所有数据表的列名已自动清理前后空格。")
 
-        numeric_cols_list = ['新增用户数','充值人数','充值金额','提现金额','充减提','首存人数','首存充值金额','新增付费人数','新增充值金额','老用户充值人数','老用户充值金额','老用户充减提','老玩家日活']
-        for col in numeric_cols_list:
-            if col in df_channel.columns: df_channel[col] = pd.to_numeric(df_channel[col], errors='coerce').fillna(0)
-            if col in df_product.columns: df_product[col] = pd.to_numeric(df_product[col], errors='coerce').fillna(0)
+        numeric_cols_list = ['新增用户数','充值人数','充值金额','提现金额','首存人数','首存充值金额','新增付费人数','新增充值金额','老用户充值人数','老用户充值金额', '老用户提现金额', '老玩家日活']
+        for df in [df_channel, df_product]:
+            for col in numeric_cols_list:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
         print("  ✓ 已将核心数据列强制转换为数字格式，并用0填充错误。")
+
+        for df in [df_channel, df_product]:
+            if '充值金额' in df.columns and '提现金额' in df.columns:
+                df['充减提'] = df['充值金额'] - df['提现金额']
+            if '老用户充值金额' in df.columns and '老用户提现金额' in df.columns:
+                df['老用户充减提'] = df['老用户充值金额'] - df['老用户提现金额']
+        print("  ✓ 已基于基础组件强制重算'充减提'和'老用户充减提'，确保逻辑准确。")
         
         df_product_pkr = df_product.copy()
         df_channel_pkr = df_channel.copy()
@@ -57,17 +65,13 @@ def load_and_prepare_data():
                 df.dropna(subset=['日期'], inplace=True)
         print("  ✓ 日期列已处理，无效日期行已自动移除。")
 
-        for df in [df_product_pkr, df_channel_pkr]:
-            if '充减提' not in df.columns: df['充减提'] = df['充值金额'] - df['提现金额']
-        print("  ✓ 已为计算准备好未经换算的原始数据副本 (PKR)。")
-
         df_cost.rename(columns={'花费（$）': '消耗'}, inplace=True)
         
-        amount_cols = ['充值金额', '提现金额', '首存充值金额', '新增充值金额', '充减提', '老用户充减提']
+        amount_cols = ['充值金额', '提现金额', '首存充值金额', '新增充值金额', '充减提', '老用户充减提', '老用户充值金额']
         for df in [df_channel, df_product]:
-            if '充减提' not in df.columns: df['充减提'] = df['充值金额'] - df['提现金额']
             for col in amount_cols:
-                if col in df.columns: df[col] /= EXCHANGE_RATE
+                if col in df.columns:
+                    df[col] /= EXCHANGE_RATE
         print(f"  ✓ 用于报表展示的数据已按 1:{EXCHANGE_RATE} 的汇率完成换算 (USD)。")
         
         print("数据预处理完成！\n")
@@ -119,7 +123,7 @@ def calculate_ltv(data_source_pkr, report_date, days, group_by_col=None, df_map=
         
         grouped[f'LTV-{days}天'] = (grouped['total_profit_pkr'] / grouped['total_first_deposit'].replace(0, np.nan)) / EXCHANGE_RATE
         return grouped[[group_by_col, f'LTV-{days}天']].fillna(0)
-    else: # 计算总体
+    else:
         total_profit_pkr = period_data['充减提'].sum()
         total_first_deposit = period_data['首存人数'].sum()
         if total_first_deposit == 0: return 0
@@ -133,8 +137,7 @@ def get_recharge_rates(df_recharge_rate, report_date):
     if not today_rates.empty:
         summary_row = today_rates[today_rates['来源渠道'].str.contains('汇总', na=False)]
         rate_data = summary_row.iloc[0] if not summary_row.empty else today_rates.iloc[0]
-        for key in rates:
-            rates[key] = rate_data.get(key, 0)
+        for key in rates: rates[key] = rate_data.get(key, 0)
     return rates
 
 
@@ -151,10 +154,9 @@ def calculate_historical_data(all_data, report_date):
 
 
 def generate_product_report(data, df_product_pkr, report_date):
-    """生成《产品日报》 - 全字段, 修正ARPPU计算"""
+    """生成《产品日报》 - 全字段, 修正所有比率计算"""
     print("\n开始生成《产品日报》...")
-    df_product_usd = data['product_usd']
-    df_cost = data['cost']
+    df_product_usd, df_cost = data['product_usd'], data['cost']
     
     daily_data_usd = df_product_usd[df_product_usd['日期'] == report_date]
     daily_data_pkr = df_product_pkr[df_product_pkr['日期'] == report_date]
@@ -164,8 +166,8 @@ def generate_product_report(data, df_product_pkr, report_date):
     row_pkr = daily_data_pkr.iloc[0]
     
     # --- 基础指标 (计数类) ---
-    new_users, recharge_users, first_deposit_users = row_usd.get('新增用户数',0), row_usd.get('充值人数',0), row_usd.get('首存人数',0)
-    new_recharge_users, old_recharge_users, old_active_users = row_usd.get('新增付费人数',0), row_usd.get('老用户充值人数',0), row_usd.get('老玩家日活',0)
+    new_users, recharge_users, first_deposit_users = row_pkr.get('新增用户数',0), row_pkr.get('充值人数',0), row_pkr.get('首存人数',0)
+    new_recharge_users, old_recharge_users, old_active_users = row_pkr.get('新增付费人数',0), row_pkr.get('老用户充值人数',0), row_pkr.get('老玩家日活',0)
 
     # --- 金额指标 (展示用, USD) ---
     total_cost = df_cost[df_cost['日期'] == report_date]['消耗'].sum()
@@ -174,10 +176,9 @@ def generate_product_report(data, df_product_pkr, report_date):
     old_recharge_amount, old_profit = row_usd.get('老用户充值金额',0), row_usd.get('老用户充减提',0)
     
     # --- 金额指标 (计算用, PKR) ---
+    recharge_amount_pkr, withdraw_amount_pkr, profit_pkr = row_pkr.get('充值金额',0), row_pkr.get('提现金额',0), row_pkr.get('充减提',0)
     first_deposit_amount_pkr = row_pkr.get('首存充值金额', 0)
-    recharge_amount_pkr = row_pkr.get('充值金额', 0)
-    old_recharge_amount_pkr = row_pkr.get('老用户充值金额', 0)
-    withdraw_amount_pkr = row_pkr.get('提现金额', 0)
+    old_recharge_amount_pkr, old_profit_pkr = row_pkr.get('老用户充值金额',0), row_pkr.get('老用户充减提',0)
 
     # --- 构建报表字典 ---
     report_dict = {
@@ -186,17 +187,17 @@ def generate_product_report(data, df_product_pkr, report_date):
         '首充成本': (total_cost / first_deposit_users if first_deposit_users>0 else 0),
         '新增用户数': int(new_users), '充值人数': int(recharge_users), '充值金额': recharge_amount,
         '提现金额': withdraw_amount, '充减提': profit,
-        '盈余率(%)': (profit/recharge_amount*100) if recharge_amount>0 else 0,
+        '盈余率(%)': (profit_pkr / recharge_amount_pkr * 100) if recharge_amount_pkr>0 else 0,
         '首存人数': int(first_deposit_users), '首存充值金额': first_deposit_amount,
         '首存付费率(%)': (first_deposit_users/new_users*100) if new_users>0 else 0,
-        '首存盈余率(%)': (((first_deposit_amount_pkr - withdraw_amount_pkr) / first_deposit_amount_pkr) * 100 if first_deposit_amount_pkr>0 else 0),
+        '首存盈余率(%)': ((first_deposit_amount_pkr - withdraw_amount_pkr) / first_deposit_amount_pkr * 100) if first_deposit_amount_pkr>0 else 0,
         '首存ARPPU': ((first_deposit_amount_pkr / first_deposit_users) / EXCHANGE_RATE if first_deposit_users > 0 else 0),
         '新增付费人数': int(new_recharge_users), '新增充值金额': new_recharge_amount,
         '新增付费率(%)': (new_recharge_users/new_users*100) if new_users>0 else 0,
         '老用户充值人数': int(old_recharge_users), '老用户充值金额': old_recharge_amount,
         '老用户付费率(%)': (old_recharge_users/old_active_users*100) if old_active_users>0 else 0,
         '老用户ARPPU': ((old_recharge_amount_pkr / old_recharge_users) / EXCHANGE_RATE if old_recharge_users > 0 else 0),
-        '老用户盈余率(%)': (old_profit/old_recharge_amount*100) if old_recharge_amount>0 else 0,
+        '老用户盈余率(%)': (old_profit_pkr / old_recharge_amount_pkr * 100) if old_recharge_amount_pkr > 0 else 0,
         'ARPPU': ((recharge_amount_pkr / recharge_users) / EXCHANGE_RATE if recharge_users > 0 else 0),
         '裂变率': (first_deposit_users/recharge_users*100) if recharge_users>0 else 0,
         **get_recharge_rates(data['recharge_rate'], report_date),
@@ -230,16 +231,13 @@ def generate_department_report(data, df_channel_pkr, report_date):
     daily_cost_by_dept = df_cost[df_cost['日期'] == report_date][['部门', '消耗']]
     report = pd.merge(report, daily_cost_by_dept, on='部门', how='left').fillna(0)
     
-    # --- ⭐️ 核心修正：按部门独立计算LTV ---
     ltv7 = calculate_ltv(df_channel_pkr, report_date, 7, group_by_col='部门', df_map=df_dept_map)
     ltv15 = calculate_ltv(df_channel_pkr, report_date, 15, group_by_col='部门', df_map=df_dept_map)
     ltv30 = calculate_ltv(df_channel_pkr, report_date, 30, group_by_col='部门', df_map=df_dept_map)
-    
     report = pd.merge(report, ltv7, on='部门', how='left')
     report = pd.merge(report, ltv15, on='部门', how='left')
     report = pd.merge(report, ltv30, on='部门', how='left')
     
-    # --- 计算其他衍生指标 ---
     new_users, first_deposit_users, recharge_amount, recharge_users = report.get('新增用户数',0), report.get('首存人数',0), report.get('充值金额',0), report.get('充值人数',0)
     first_deposit_amount, withdraw_amount, new_recharge_users = report.get('首存充值金额',0), report.get('提现金额',0), report.get('新增付费人数',0)
     old_recharge_users, old_recharge_amount, old_profit, old_active_users = report.get('老用户充值人数',0), report.get('老用户充值金额',0), report.get('老用户充减提',0), report.get('老玩家日活',0)
@@ -264,10 +262,8 @@ def generate_department_report(data, df_channel_pkr, report_date):
     report = pd.merge(report, hist_data, on='部门', how='left')
     report['日期'] = report_date.strftime('%Y-%m-%d')
     
-    # --- 添加总计行 ---
     total_row = report.sum(numeric_only=True).to_frame().T
     total_row['部门'] = '总计'
-    # 重新计算总计的比率指标和LTV
     for days in [7, 15, 30]:
         total_ltv = calculate_ltv(df_channel_pkr, report_date, days)
         total_row[f'LTV-{days}天'] = total_ltv
@@ -285,11 +281,9 @@ def generate_channel_report(data, report_date):
     df_channel_usd, df_cost, df_dept_map = data['channel_usd'], data['cost'], data['dept_map']
     report = df_channel_usd[df_channel_usd['日期'] == report_date].copy()
     if report.empty: return None
-
     report = map_department(report, df_dept_map)
     daily_cost_by_dept = df_cost[df_cost['日期'] == report_date][['部门', '消耗']]
     report = pd.merge(report, daily_cost_by_dept, on='部门', how='left').fillna(0)
-    
     print("✓ 《渠道总汇表》数据生成完成！\n")
     return report
 
@@ -316,7 +310,6 @@ def main():
     for filename, (df, decimals) in reports_to_save.items():
         if df is not None and not df.empty:
             try:
-                # 重新排序报表的列
                 if "产品日报" in filename:
                     cols_order = ['日期','产品','消耗','注册成本','首充成本','新增用户数','充值人数','充值金额','提现金额','充减提','盈余率(%)','首存人数','首存充值金额','首存付费率(%)','首存盈余率(%)','首存ARPPU','新增付费人数','新增充值金额','新增付费率(%)','老用户充值人数','老用户充值金额','老用户付费率(%)','老用户ARPPU','老用户盈余率(%)','ARPPU','次日复充率(%)','3日复充率(%)','7日复充率(%)','15日复充率(%)','30日复充率(%)','LTV-7天','LTV-15天','LTV-30天','裂变率','历史消耗','历史充提差','辅助列']
                     df = df.reindex(columns=[col for col in cols_order if col in df.columns])
