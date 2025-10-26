@@ -1,0 +1,2062 @@
+## VERSION: forcehash_v3 + aria_combobox helper + generic_dropdown + continue_if_missing
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+import asyncio, argparse, contextlib, datetime as dt, json, os, re
+from pathlib import Path
+from typing import Optional
+from playwright.async_api import async_playwright, Page, BrowserContext
+
+# ---------- Utils ----------
+def sanitize_filename(name: str) -> str:
+    name = re.sub(r"[\\/:*?\"<>|]+", "_", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    return name[:180]
+
+def page_of(scope):
+    return getattr(scope, "page", scope)
+
+
+# --- Helpers: robust platform dropdown opening ---
+async def _try_expand_filters(scope):
+    """Try to expand hidden filter panels (common in Element/AntD UIs)."""
+    pg = page_of(scope)
+    texts = ["筛选", "更多", "高级", "展开", "更多筛选", "条件", "平台"]
+    for t in texts:
+        try:
+            locs = [
+                scope.get_by_role("button", name=re.compile(re.escape(t))),
+                scope.locator("button, .el-button, .ant-btn").filter(has_text=re.compile(re.escape(t))),
+                scope.get_by_text(re.compile(re.escape(t)))
+            ]
+            for lc in locs:
+                if await lc.count():
+                    el = lc.first
+                    with contextlib.suppress(Exception): await el.scroll_into_view_if_needed()
+                    with contextlib.suppress(Exception): await el.click()
+                    with contextlib.suppress(Exception): await pg.wait_for_timeout(150)
+        except Exception:
+            pass
+
+async def _open_platform_dropdown(scope, select_idx: int) -> bool:
+    """Try many ways to open platform dropdown. Return True if options likely visible."""
+    pg = page_of(scope)
+    await _try_expand_filters(scope)
+
+    # candidate containers
+    candidates = [
+        "[role='combobox']",
+        ".el-select .el-select__selection",
+        ".el-select .select-trigger",
+        ".ant-select-selector",
+        ".el-select",
+        ".mx-input",
+        ".vxe-select--wrapper",
+    ]
+
+    box = None
+    for css in candidates:
+        loc = scope.locator(css)
+        try:
+            cnt = await loc.count()
+        except Exception:
+            cnt = 0
+        if cnt:
+            box = loc.nth(select_idx if select_idx < cnt else 0); break
+
+    if box is None:
+        return False
+
+    # Scroll into view
+    with contextlib.suppress(Exception):
+        await box.scroll_into_view_if_needed()
+
+    # Several click strategies
+    strategies = []
+
+    # 1) Click container
+    strategies.append(lambda: box.click())
+    # 2) Force click
+    strategies.append(lambda: box.click(force=True))
+    # 3) Click caret/icon within
+    strategies.append(lambda: box.locator(".el-select__caret, .el-select__suffix, .ant-select-arrow").click())
+    strategies.append(lambda: box.locator(".el-select__caret, .el-select__suffix, .ant-select-arrow").click(force=True))
+    # 4) Focus input and press keys
+    strategies.append(lambda: box.press("Enter"))
+    strategies.append(lambda: box.press("Space"))
+    strategies.append(lambda: box.press("ArrowDown"))
+
+    for action in strategies:
+        with contextlib.suppress(Exception):
+            await action()
+            # wait for dropdown
+            if await _dropdown_visible(pg):
+                return True
+            with contextlib.suppress(Exception):
+                await pg.wait_for_timeout(120)
+
+    # Final attempt: dispatch mousedown via JS
+    try:
+        elh = await box.element_handle()
+        if elh:
+            await pg.evaluate("(e)=>{e.dispatchEvent(new MouseEvent('mousedown',{bubbles:true}));e.dispatchEvent(new MouseEvent('click',{bubbles:true}));}", elh)
+            if await _dropdown_visible(pg):
+                return True
+    except Exception:
+        pass
+
+    return await _dropdown_visible(pg)
+
+async def _dropdown_visible(pg) -> bool:
+    try:
+        lb = pg.get_by_role("listbox")
+        if await lb.count():
+            await lb.first.wait_for(state="visible", timeout=500)
+            return True
+    except Exception:
+        pass
+    # CSS panels
+    try:
+        panel = pg.locator(".el-select-dropdown:visible, .ant-select-dropdown:visible, .vxe-select--panel:visible")
+        return (await panel.count()) > 0
+    except Exception:
+        return False
+
+async def _open_platform_by_aria(scope, select_idx: int) -> bool:
+    """Target the exact Element Plus input[role=combobox] with aria-controls and use it to open listbox."""
+    pg = page_of(scope)
+    inp = scope.locator("input.el-select__input[role='combobox']")
+    try:
+        n = await inp.count()
+    except Exception:
+        n = 0
+    if n == 0:
+        return False
+
+    i = select_idx if select_idx < n else 0
+    node = inp.nth(i)
+
+    # Gather aria attributes for debugging
+    try:
+        ac = await node.get_attribute("aria-controls")
+        ae = await node.get_attribute("aria-expanded")
+        aid = await node.get_attribute("id")
+        print(f"[ARIA] combobox idx={i}, id={aid}, controls={ac}, expanded={ae}")
+    except Exception:
+        ac = None
+
+    # Focus then try keys & clicks
+    with contextlib.suppress(Exception): await node.scroll_into_view_if_needed()
+    with contextlib.suppress(Exception): await node.focus()
+    with contextlib.suppress(Exception): await node.click()
+    for key in ["ArrowDown", "Enter", " "]:
+        with contextlib.suppress(Exception):
+            await node.press(key)
+            if await _dropdown_visible(pg):
+                return True
+            await pg.wait_for_timeout(120)
+
+    # If there is an aria-controls, wait for that listbox id
+    if ac:
+        try:
+            lb = pg.locator(f"#{ac}")
+            await lb.wait_for(state="visible", timeout=800)
+            return True
+        except Exception:
+            pass
+
+    # Try suffix/caret relative to the input
+    try:
+        container = node.locator("xpath=ancestor::*[contains(@class,'el-select')][1]")
+        if await container.count():
+            suf = container.locator(".el-select__suffix, .el-select__caret")
+            if await suf.count():
+                with contextlib.suppress(Exception): await suf.first.click()
+                if await _dropdown_visible(pg):
+                    return True
+                with contextlib.suppress(Exception): await suf.first.click(force=True)
+                if await _dropdown_visible(pg):
+                    return True
+    except Exception:
+        pass
+
+    # JS events
+    try:
+        elh = await node.element_handle()
+        if elh:
+            await pg.evaluate("(e)=>{e.dispatchEvent(new MouseEvent('mousedown',{bubbles:true}));e.dispatchEvent(new MouseEvent('click',{bubbles:true}));}", elh)
+            if await _dropdown_visible(pg):
+                return True
+    except Exception:
+        pass
+
+    return await _dropdown_visible(pg)
+async def snapshot(scope, tag: str, shotdir: Path):
+    pg = page_of(scope)
+    try:
+        shotdir.mkdir(parents=True, exist_ok=True)
+        p = shotdir / f"{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}_{tag}.png"
+        await pg.screenshot(path=str(p), full_page=True)
+        print(f"[SHOT] {p.name}")
+    except Exception as e:
+        print(f"[SHOT-FAIL] {tag}: {e}")
+
+async def wait_login_pause(page: Page, shotdir: Path, *, once_flag: dict):
+    if once_flag.get("done"): return
+    try:
+        html = await page.content()
+        if any(k in html for k in ["登录","驗證碼","验证码","captcha","滑块","扫一扫登录","短信验证码"]):
+            print("[PAUSE] 检测到登录/验证码界面，请处理后按 ▶ 继续。")
+            await snapshot(page, "login_pause", shotdir)
+            await page.pause()
+    except Exception:
+        pass
+    finally:
+        once_flag["done"] = True
+
+def get_scope(page: Page, frame_selector: str = ""):
+    return page.frame_locator(frame_selector) if frame_selector else page
+
+# ---------- Menu ----------
+async def goto_by_menu(scope, menu_path: list, shotdir: Path) -> bool:
+    pg = page_of(scope)
+
+    async def _try_click(_scope, text: str) -> bool:
+        rx = re.compile(re.escape(text.strip()))
+        # Prefer visible elements
+        cands = [
+            _scope.get_by_role("menuitem", name=rx),
+            _scope.locator(".el-menu .el-menu-item:visible, .el-submenu__title:visible").filter(has_text=rx),
+            _scope.get_by_text(rx, exact=True),
+            _scope.locator("a:visible,button:visible,span:visible,div:visible").filter(has_text=rx),
+        ]
+        for loc in cands:
+            try:
+                cnt = await loc.count()
+            except Exception:
+                cnt = 0
+            if cnt:
+                el = loc.first
+                try:
+                    await el.scroll_into_view_if_needed()
+                except Exception:
+                    pass
+                with contextlib.suppress(Exception):
+                    await el.hover()
+                try:
+                    await el.click()
+                    return True
+                except Exception:
+                    # force click fallback
+                    with contextlib.suppress(Exception):
+                        await el.click(force=True)
+                        return True
+        return False
+
+    # Expand any collapsed submenus if needed
+    async def _expand_if_possible(_scope):
+        subs = _scope.locator(".el-submenu__title:visible")
+        try:
+            n = await subs.count()
+        except Exception:
+            n = 0
+        for i in range(n):
+            title = subs.nth(i)
+            with contextlib.suppress(Exception):
+                txt = (await title.inner_text()).strip()
+                # Heuristic: expand generic submenus that might contain our items
+                if txt and txt not in ("",):
+                    with contextlib.suppress(Exception):
+                        await title.click()
+
+    # Iframes fallback: try within each frame as well
+    async def _try_everywhere(text: str) -> bool:
+        # current scope
+        if await _try_click(scope, text):
+            return True
+        # try expanding submenus and retry
+        await _expand_if_possible(scope)
+        if await _try_click(scope, text):
+            return True
+        # frames
+        try:
+            for fr in pg.frames:
+                with contextlib.suppress(Exception):
+                    sc = fr
+                    if await _try_click(sc, text):
+                        return True
+                    await _expand_if_possible(sc)
+                    if await _try_click(sc, text):
+                        return True
+        except Exception:
+            pass
+        # last resort: partial match (remove spaces)
+        norm = re.sub(r"\s+", "", text)
+        return await _try_click(scope, norm)
+
+    for text in menu_path:
+        # wait a bit for menus to render after route change
+        with contextlib.suppress(Exception):
+            await pg.wait_for_load_state("domcontentloaded")
+        with contextlib.suppress(Exception):
+            await pg.wait_for_timeout(200)
+
+        clicked = False
+        # retry loop
+        for _ in range(3):
+            if await _try_everywhere(text):
+                clicked = True
+                break
+            # small wait and retry after trying to expand
+            with contextlib.suppress(Exception):
+                await pg.wait_for_timeout(400)
+        if not clicked:
+            print(f"[WARN] Menu not found: {text}")
+            await snapshot(scope, f"no_menu_{text}", shotdir)
+            return False
+        with contextlib.suppress(Exception):
+            await pg.wait_for_load_state("networkidle")
+        with contextlib.suppress(Exception):
+            await pg.wait_for_timeout(200)
+    return True
+
+    return True
+
+# ---------- Platform (manual: read only, never click) ----------
+async def read_selected_platform(scope, select_idx: int) -> Optional[str]:
+    """尽可能鲁棒地读取选中的平台文本（只读不点）。支持 Element Plus / AntD / VXE。"""
+    import contextlib as _ctx, re as _re
+    try:
+        # 定位 select 容器（兼容多种 UI 框架）
+        container_selectors = [
+            ".el-select",
+            ".ant-select",
+            ".vxe-select--wrapper",
+            "[role='combobox']",
+            ".mx-input",
+        ]
+        box = None
+        for css in container_selectors:
+            loc = scope.locator(css)
+            cnt = await loc.count()
+            if cnt:
+                box = loc.nth(select_idx if select_idx < cnt else 0)
+                break
+        if box is None:
+            # 兜底：仍尝试 Element Plus 容器
+            box = scope.locator(".el-select").nth(select_idx)
+
+        # 1) Element Plus 多选标签
+        tags = box.locator(".el-select__tags .el-tag .el-tag__content, .el-select__tags .el-tag span")
+        if await tags.count():
+            texts = []
+            limit = min(await tags.count(), 5)
+            for i in range(limit):
+                with _ctx.suppress(Exception):
+                    t = (await tags.nth(i).inner_text()).strip()
+                    if t:
+                        texts.append(t)
+            if texts:
+                return _re.sub(r"\s+", " ", ",".join(texts))
+
+        # 2) Element Plus 单选项
+        for sel_css in [
+            ".el-select__selected-item",
+            ".el-select__selection span",
+            ".el-select__selection .el-select__selected-item",
+            ".el-select .el-select__selected-item",
+            ".select-trigger .el-select__selected-item",
+        ]:
+            sel = box.locator(sel_css)
+            if await sel.count():
+                txt = (await sel.first.inner_text()).strip()
+                if txt:
+                    return _re.sub(r"\s+", " ", txt)
+
+        # 3) Ant Design 单/多选
+        ant_multi = box.locator(".ant-select-selection-overflow-item .ant-select-selection-item")
+        if await ant_multi.count():
+            texts = []
+            limit = min(await ant_multi.count(), 5)
+            for i in range(limit):
+                with _ctx.suppress(Exception):
+                    t = (await ant_multi.nth(i).inner_text()).strip()
+                    if t:
+                        texts.append(t)
+            if texts:
+                return _re.sub(r"\s+", " ", ",".join(texts))
+        for ant_css in [
+            ".ant-select-selection-item",
+            ".ant-select-selector .ant-select-selection-item",
+            ".ant-select-selection-item-content",
+        ]:
+            ant = box.locator(ant_css)
+            if await ant.count():
+                txt = (await ant.first.inner_text()).strip()
+                if txt:
+                    return _re.sub(r"\s+", " ", txt)
+
+        # 4) 输入框值（Element/AntD/VXE）
+        for ip_css in [
+            "input.el-select__input[role='combobox']",
+            "input[role='combobox']",
+            ".vxe-input--inner",
+            ".ant-select-selection-search-input",
+        ]:
+            ipt = box.locator(ip_css)
+            if await ipt.count():
+                with _ctx.suppress(Exception):
+                    val = await ipt.first.input_value()
+                    if val and val.strip():
+                        return _re.sub(r"\s+", " ", val.strip())
+                with _ctx.suppress(Exception):
+                    ph = await ipt.first.get_attribute("placeholder")
+                    if ph and ph.strip() and ph.strip() not in {"请选择", "渠道分组查询"}:
+                        return _re.sub(r"\s+", " ", ph.strip())
+
+        # 5) 兜底：读取容器文本，去装饰符与占位符
+        with _ctx.suppress(Exception):
+            raw = (await box.inner_text()).strip()
+            if raw:
+                raw = _re.sub(r"\s+", " ", raw)
+                raw = raw.replace("▼", "").replace("▲", "").replace("▾", "").strip()
+                if raw and raw not in {"请选择", "渠道分组查询"}:
+                    return raw
+    except Exception:
+        pass
+    return None
+
+async def _clear_current_selection(scope, select_idx: int) -> bool:
+    """
+    清除当前已选择的平台（点击 X 按钮）
+    返回：是否成功清除
+    """
+    pg = page_of(scope)
+    
+    try:
+        # 尝试多种选择器找到清除按钮
+        clear_button_selectors = [
+            # Element Plus 的关闭按钮（tag 内的 X）
+            ".el-select .el-select__tags .el-tag__close",
+            ".el-select .el-select__tags .el-icon-close",
+            # Element Plus 的清除按钮（整体清除）
+            ".el-select .el-select__clear",
+            ".el-select .el-icon-circle-close",
+            # Ant Design 的关闭按钮
+            ".ant-select-selector .ant-select-selection-item-remove",
+            ".ant-select-clear",
+            # VXE 的关闭按钮
+            ".vxe-select--wrapper .vxe-select--clear-icon",
+            # 通用的关闭图标
+            ".el-select [class*='close']:visible",
+            ".el-select [class*='clear']:visible",
+            # SVG 图标
+            ".el-select svg.el-icon",
+        ]
+        
+        # 定位到具体的 select 容器
+        select_container = None
+        try:
+            selects = scope.locator(".el-select")
+            count = await selects.count()
+            print(f"[CLEAR-DEBUG] 找到 {count} 个 .el-select 元素，需要第 {select_idx} 个")
+            if count > select_idx:
+                select_container = selects.nth(select_idx)
+                print(f"[CLEAR-DEBUG] 定位到目标 select 容器")
+        except Exception as e:
+            print(f"[CLEAR-DEBUG] 定位 select 容器失败: {e}")
+            pass
+        
+        if select_container:
+            # 在特定容器内查找清除按钮
+            for i, selector in enumerate(clear_button_selectors):
+                try:
+                    clear_btn = select_container.locator(selector)
+                    btn_count = await clear_btn.count()
+                    if btn_count > 0:
+                        print(f"[CLEAR] 找到清除按钮（选择器 {i+1}/{len(clear_button_selectors)}）: {selector}")
+                        # 尝试滚动到可见并悬停（激活清除按钮）
+                        with contextlib.suppress(Exception):
+                            await select_container.hover()
+                        await clear_btn.first.click()
+                        print(f"[CLEAR] 已点击清除按钮")
+                        await asyncio.sleep(0.5)  # 等待清除生效
+                        return True
+                except Exception as e:
+                    continue
+        
+        # 如果上面没找到，尝试全局查找（针对第 select_idx 个）
+        print(f"[CLEAR-DEBUG] 在容器内未找到，尝试全局查找")
+        for i, selector in enumerate(clear_button_selectors):
+            try:
+                all_clear = pg.locator(selector)
+                count = await all_clear.count()
+                if count > select_idx:
+                    print(f"[CLEAR] 找到全局清除按钮: {selector}")
+                    await all_clear.nth(select_idx).click()
+                    print(f"[CLEAR] 已点击清除按钮")
+                    await asyncio.sleep(0.5)
+                    return True
+            except Exception:
+                continue
+        
+        print("[CLEAR] 未找到清除按钮，可能需要手动清除或不支持清除")
+        return False
+        
+    except Exception as e:
+        print(f"[CLEAR] 清除选择时出错: {e}，继续...")
+        return False
+
+async def auto_select_platform_option(scope, target_text: str, shotdir: Path) -> bool:
+    """
+    自动在已打开的下拉列表中查找并点击目标平台选项。
+    - 优先直接点击可见项
+    - 避免强依赖滚动；提供 force 点击与 JS 点击兜底
+    返回：是否成功点击
+    """
+    pg = page_of(scope)
+
+    # 等待下拉选项渲染
+    await asyncio.sleep(0.4)
+
+    # 在"当前激活的下拉面板"内查找选项，避免跨面板误点
+    panel_selectors = [
+        ".el-select-dropdown",
+        ".ant-select-dropdown",
+        ".vxe-select--panel",
+        "[role='listbox']",
+    ]
+
+    def _match(a: str, b: str) -> bool:
+        return a in b or b in a
+
+    # 尝试从目标文本中解析出平台编号（例如 "1153 | xxx" → 1153）
+    id_match = re.search(r"^\s*(\d+)\s*\|", target_text)
+    target_id = id_match.group(1) if id_match else None
+
+    # 取最后一个可见面板作为当前激活的下拉
+    active_found = False
+    for ps in panel_selectors:
+        panels = pg.locator(ps)
+        cnt = await panels.count()
+        if not cnt:
+            continue
+        for i in range(cnt - 1, -1, -1):
+            panel = panels.nth(i)
+            with contextlib.suppress(Exception):
+                if not await panel.is_visible():
+                    continue
+            # 在该面板内定位选项
+            options = panel.locator("[role='option'], .el-select-dropdown__item, .ant-select-item, .vxe-select--option, .el-option")
+            opt_cnt = await options.count()
+            if not opt_cnt:
+                continue
+            active_found = True
+            print(f"[INFO] 在激活下拉面板内找到 {opt_cnt} 个选项，查找：{target_text}")
+            for j in range(opt_cnt):
+                option = options.nth(j)
+                try:
+                    text = await option.inner_text()
+                    text = re.sub(r"\s+", " ", text.strip())
+                    # 跳过"全平台"，除非目标就是它
+                    if text == "全平台" and target_text != "全平台":
+                        continue
+                    ok = False
+                    if _match(target_text, text):
+                        ok = True
+                    elif target_id:
+                        m = re.search(r"^\s*(\d+)\s*\|", text)
+                        if m and m.group(1) == target_id:
+                            ok = True
+                    if not ok:
+                        continue
+
+                    print(f"[AUTO] 自动选择平台：{text}")
+                    with contextlib.suppress(Exception):
+                        await option.click()
+                        await asyncio.sleep(0.25)
+                        return True
+                    with contextlib.suppress(Exception):
+                        await option.click(force=True)
+                        await asyncio.sleep(0.25)
+                        return True
+                    with contextlib.suppress(Exception):
+                        await option.evaluate("el => el && el.click && el.click()")
+                        await asyncio.sleep(0.25)
+                        return True
+                except Exception:
+                    continue
+
+    # 键入筛选兜底：对获得焦点的 combobox 输入目标关键字并回车
+    try:
+        focus_inputs = pg.locator("input[role='combobox']:focus, .el-select input.el-select__input:focus, .ant-select-selection-search-input:focus")
+        if await focus_inputs.count():
+            key = target_id or target_text
+            with contextlib.suppress(Exception):
+                await focus_inputs.first.fill("")
+            with contextlib.suppress(Exception):
+                await focus_inputs.first.type(str(key))
+            with contextlib.suppress(Exception):
+                await focus_inputs.first.press("Enter")
+            await asyncio.sleep(0.35)
+            return True
+    except Exception:
+        pass
+
+    # 若未找到激活面板或点击未成功，退回到全局兜底（极少数情况）
+    if not active_found:
+        option_selectors = [
+            "[role='option']",
+            ".el-select-dropdown__item",
+            ".ant-select-item",
+            ".vxe-select--option",
+            ".el-option"
+        ]
+        for selector in option_selectors:
+            try:
+                options = pg.locator(selector)
+                count = await options.count()
+                if count <= 0:
+                    continue
+                for i in range(count):
+                    option = options.nth(i)
+                    try:
+                        text = await option.inner_text()
+                        text = re.sub(r"\s+", " ", text.strip())
+                        if text == "全平台" and target_text != "全平台":
+                            continue
+                        ok = False
+                        if _match(target_text, text):
+                            ok = True
+                        elif target_id:
+                            m = re.search(r"^\s*(\d+)\s*\|", text)
+                            if m and m.group(1) == target_id:
+                                ok = True
+                        if not ok:
+                            continue
+                        with contextlib.suppress(Exception):
+                            await option.click()
+                            await asyncio.sleep(0.25)
+                            return True
+                        with contextlib.suppress(Exception):
+                            await option.click(force=True)
+                            await asyncio.sleep(0.25)
+                            return True
+                        with contextlib.suppress(Exception):
+                            await option.evaluate("el => el && el.click && el.click()")
+                            await asyncio.sleep(0.25)
+                            return True
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+    print(f"[WARN] 未能自动找到匹配的平台选项：{target_text}")
+    await snapshot(scope, f"auto_select_fail_{sanitize_filename(target_text)}", shotdir)
+    return False
+
+async def wait_for_user_platform(scope, select_idx: int, target_text: str, timeout_ms: int = 180000, auto_mode: bool = True, clear_before_select: bool = False) -> Optional[str]:
+    """
+    选择平台：支持自动模式和手动模式
+    auto_mode=True: 自动查找并点击目标平台（默认）
+    auto_mode=False: 等待手动选择
+    clear_before_select=True: 选择前先清除之前的选择（用于 LTV 等任务）
+    返回：最终用于导出的"平台名"（若始终读不到则返回 None）。
+    """
+    pg = page_of(scope)
+    shotdir = Path("_shots")
+
+    def _norm(s: Optional[str]) -> Optional[str]:
+        return re.sub(r"\s+", " ", s.strip()) if s else None
+
+    before = _norm(await read_selected_platform(scope, select_idx))
+
+    # 若当前已是目标平台，则直接返回成功，避免重复点击导致判定失败
+    def _extract_id(txt: Optional[str]) -> Optional[str]:
+        if not txt: return None
+        m = re.match(r"^(\d+)\s*\|", txt)
+        return m.group(1) if m else None
+
+    if before:
+        tid = _extract_id(target_text)
+        bid = _extract_id(before)
+        if target_text in before or (tid and bid and tid == bid) or (target_text == "全平台" and before == "全平台"):
+            print(f"[OK] 已是目标平台：{before}")
+            return before
+
+    # Stabilize after route change with better timeout handling
+    try:
+        await pg.wait_for_load_state("domcontentloaded", timeout=10000)
+        with contextlib.suppress(Exception):
+            await pg.wait_for_load_state("networkidle", timeout=15000)
+    except Exception as e:
+        print(f"[WARN] Page load timeout: {e}, continue anyway")
+        pass
+
+    # 如果需要清除之前的选择（仅 LTV 等特定任务）
+    # 注意：只要有之前的选择就清除，不管是否匹配（因为可能是之前选择残留）
+    if clear_before_select and before and auto_mode:
+        print(f"[CLEAR] 检测到之前的选择：{before}，准备清除")
+        await _clear_current_selection(scope, select_idx)
+        # 清除后等待页面稳定
+        await asyncio.sleep(0.5)
+        # 验证是否清除成功
+        after_clear = _norm(await read_selected_platform(scope, select_idx))
+        if after_clear:
+            print(f"[CLEAR] 清除后仍有选择：{after_clear}，继续尝试")
+        else:
+            print(f"[CLEAR] 清除成功")
+
+    # First, try ARIA-driven open on exact combobox input
+    opened = await _open_platform_by_aria(scope, select_idx)
+    if not opened:
+        opened = await _open_platform_dropdown(scope, select_idx)
+    if not opened:
+        print("[INFO] 未检测到有效的下拉面板，使用当前平台继续。")
+        return before
+
+    # --- stabilization after potential page refresh & open the dropdown ---
+    try:
+        await pg.wait_for_load_state("domcontentloaded")
+        with contextlib.suppress(Exception):
+            await pg.wait_for_load_state("networkidle")
+    except Exception:
+        pass
+
+    # 自动模式：尝试自动选择
+    if auto_mode:
+        print(f"[AUTO] 自动选择模式：正在查找 {target_text}")
+        success = await auto_select_platform_option(scope, target_text, shotdir)
+        
+        if success:
+            # 等待选择生效（增加等待时间）
+            await asyncio.sleep(1.0)
+            
+            # 多次验证，因为页面可能需要时间更新
+            for attempt in range(3):
+                final_name = _norm(await read_selected_platform(scope, select_idx))
+                if final_name:
+                    # 检查是否真的选择了目标（模糊匹配）
+                    if target_text in final_name or final_name in target_text:
+                        print(f"[OK] 自动选择成功：{final_name}")
+                        return final_name
+                    else:
+                        print(f"[WARN] 选择不匹配，期望：{target_text}，实际：{final_name}")
+                        if attempt < 2:
+                            print(f"[RETRY] 等待页面更新...")
+                            await asyncio.sleep(0.5)
+                            continue
+                        else:
+                            # 可能是页面逻辑问题，返回当前选择
+                            print(f"[OK] 使用当前选择：{final_name}")
+                            return final_name
+                else:
+                    if attempt < 2:
+                        await asyncio.sleep(0.5)
+                        continue
+        
+        print(f"[WARN] 自动选择失败，尝试手动模式")
+    
+    # 手动模式或自动失败后的备用方案
+    # Prefer ARIA role first
+    combobox = None
+    try:
+        cb_count = await scope.get_by_role("combobox").count()
+        if cb_count and select_idx < cb_count:
+            combobox = scope.get_by_role("combobox").nth(select_idx)
+    except Exception:
+        combobox = None
+
+    if combobox is None:
+        # fallbacks for common UI libs
+        candidates = [
+            ".el-select .el-select__selection",
+            ".el-select .select-trigger",
+            ".ant-select-selector",
+            "[role='combobox']",
+            ".vxe-select--wrapper",
+            ".mx-input"
+        ]
+        for css in candidates:
+            loc = scope.locator(css)
+            cnt = await loc.count()
+            if cnt:
+                combobox = loc.nth(select_idx if select_idx < cnt else 0)
+                break
+        if combobox is None:
+            combobox = scope.locator(".el-select").nth(select_idx)
+
+    with contextlib.suppress(Exception):
+        await combobox.scroll_into_view_if_needed()
+
+    # Try to open the listbox so the user can click an item
+    opened = False
+    with contextlib.suppress(Exception):
+        await combobox.click()
+        opened = True
+    if not opened:
+        with contextlib.suppress(Exception):
+            await combobox.click(force=True)
+            opened = True
+
+    # Keep the dropdown open (best-effort): wait for options/listbox to appear
+    try:
+        lb = pg.get_by_role("listbox")
+        if await lb.count():
+            await lb.first.wait_for(state="visible", timeout=2000)
+    except Exception:
+        with contextlib.suppress(Exception):
+            await pg.wait_for_selector("[role='option'], .el-select-dropdown, .ant-select-dropdown, .vxe-select--panel", state="visible", timeout=2000)
+
+    print(f"[WAIT] 请在平台下拉中手动选择：{target_text}（选好后点击 ▶ 继续）")
+    await snapshot(scope, f"wait_platform_{sanitize_filename(target_text)}", shotdir)
+    with contextlib.suppress(Exception):
+        await pg.pause()  # 你点 ▶ 后继续
+
+    elapsed = 0.0
+    step = 1.0
+    final_name: Optional[str] = None
+
+    try:
+        while elapsed < (timeout_ms / 1000.0):
+            cur = _norm(await read_selected_platform(scope, select_idx))
+            if cur:
+                print(f"[INFO] 当前已选平台：{cur}（目标：{target_text}）")
+                if target_text in cur:
+                    print(f"[OK] 已选择平台（匹配目标）：{cur}")
+                    final_name = cur
+                    break
+                if before is None or cur != before:
+                    print(f"[OK] 已选择平台（未匹配目标，但检测到更改）：{cur}")
+                    final_name = cur
+                    break
+            await asyncio.sleep(step)
+            elapsed += step
+    except Exception as e:
+        print(f"[WARN] 等待平台期间出现异常：{e}")
+
+    if final_name is None:
+        final_name = _norm(await read_selected_platform(scope, select_idx))
+        if final_name:
+            print(f"[OK] 使用当前平台（兜底）：{final_name}")
+        else:
+            print(f"[SKIP] 未能读到已选平台，跳过。")
+    return final_name
+
+# ---------- Date / Query ----------
+async def open_date_panel(scope, strategies: list, shotdir: Path) -> bool:
+    pg = page_of(scope)
+    for strat in strategies:
+        q = strat.get("query")
+        try:
+            loc = scope.locator(q)
+            if await loc.count():
+                await loc.first.click()
+                try: await pg.wait_for_timeout(100)
+                except Exception: pass
+                return True
+        except Exception: pass
+    await snapshot(scope, "no_date_open", shotdir); return False
+
+async def type_range(scope, start_str: str, end_str: str):
+    pg = page_of(scope)
+    inputs = scope.locator(".el-date-editor input, .ant-picker-input input, .vxe-input--inner, input.mx-input")
+    if await inputs.count() >= 2:
+        await inputs.nth(0).fill(start_str)
+        await inputs.nth(1).fill(end_str)
+        with contextlib.suppress(Exception):
+            await inputs.nth(1).press("Enter")
+        try: await pg.wait_for_timeout(120)
+        except Exception: pass
+        return True
+    return False
+
+async def pick_quick_or_type(scope, label: str, shotdir: Path) -> bool:
+    today = dt.date.today()
+    if label == "昨天":
+        s = today - dt.timedelta(days=1); e = s
+    elif label == "本月":
+        s = today.replace(day=1); e = today
+    elif label == "上月":
+        first_this = today.replace(day=1); last_prev = first_this - dt.timedelta(days=1)
+        s = last_prev.replace(day=1); e = last_prev
+    else:
+        return False
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
+        if await type_range(scope, s.strftime(fmt), e.strftime(fmt)):
+            return True
+    # 可见快捷项再点
+    pg = page_of(scope)
+    btn = scope.locator(
+        ".el-picker-panel__shortcut:visible, .vxe-picker--panel .vxe-button:visible, .ant-picker-now-btn:visible"
+    ).get_by_text(label, exact=False)
+    if await btn.count():
+        try:
+            await btn.first.click()
+            try: await pg.wait_for_timeout(120)
+            except Exception: pass
+            return True
+        except Exception:
+            return False
+    return False
+
+async def click_query(scope) -> bool:
+    pg = page_of(scope)
+    for nm in ["查询","搜索","Search","查询数据","筛选"]:
+        btn = scope.get_by_role("button", name=re.compile(nm))
+        if await btn.count():
+            await btn.first.scroll_into_view_if_needed(); await btn.first.click()
+            with contextlib.suppress(Exception): await pg.wait_for_load_state("networkidle")
+            try: await pg.wait_for_timeout(220)
+            except Exception: pass
+            return True
+    return False
+
+async def wait_table_loaded(scope):
+    pg = page_of(scope)
+    with contextlib.suppress(Exception):
+        await pg.wait_for_selector(".el-table, .ant-table, table, .vxe-table", state="visible", timeout=8000)
+    mask = pg.locator(".el-loading-mask, .vxe-modal--wrapper.lock--view.is--mask")
+    if await mask.count():
+        with contextlib.suppress(Exception):
+            await mask.first.wait_for(state="hidden", timeout=8000)
+    try: await pg.wait_for_timeout(200)
+    except Exception: pass
+
+# ---------- Export with modal ----------
+async def wait_any_modal(scope, timeout=8000):
+    pg = page_of(scope)
+    sels = [
+        ".vxe-modal--wrapper.is--visible.is--active",
+        ".el-message-box__wrapper",
+        ".el-dialog__wrapper",
+        ".el-dialog.is-active, .el-dialog[aria-modal='true']",
+        ".ant-modal-root .ant-modal-wrap, .ant-modal-root .ant-modal"
+    ]
+    for sel in sels:
+        try:
+            await pg.wait_for_selector(sel, state="visible", timeout=timeout)
+            loc = pg.locator(sel)
+            if await loc.count():
+                return loc.first
+        except Exception:
+            pass
+    return None
+
+async def _detect_global_no_data(scope) -> bool:
+    """
+    识别全局顶部/轻提示的"暂无导出数据"等提示（例如红色toast），非对话框内元素。
+    返回：True 表示检测到无数据提示。
+    """
+    try:
+        pg = page_of(scope)
+        # 常见 UI 库的全局提示容器选择器（Element Plus / VXE / AntD）
+        toast_selectors = [
+            ".el-message.el-message--error, .el-message.is-error, .el-message--warning",
+            ".el-notification__content:has-text('暂无'), .el-notification:has-text('暂无')",
+            ".vxe-modal--wrapper .vxe-modal--body:has-text('暂无')",
+            ".ant-message-notice:has-text('暂无'), .ant-notification-notice:has-text('暂无')",
+            "[class*='message']:has-text('暂无导出数据')",
+            "[class*='toast']:has-text('暂无导出数据')",
+            # 有的页面文案里"暂无导出 数据"中间有空白
+            "[class*='message']:has-text('暂无导出 数据')",
+            "[class*='toast']:has-text('暂无导出 数据')",
+        ]
+        for sel in toast_selectors:
+            try:
+                loc = pg.locator(sel)
+                if await loc.count():
+                    # 读取部分文本用于日志
+                    with contextlib.suppress(Exception):
+                        txt = (await loc.first.inner_text()).strip()
+                        print(f"[NO-DATA] ✓ 检测到全局提示：'{txt[:80]}'")
+                    return True
+            except Exception:
+                continue
+        return False
+    except Exception as e:
+        print(f"[NO-DATA] 全局提示检测异常: {e}")
+        return False
+
+async def _check_no_data_message(modal) -> bool:
+    """
+    检查模态框中是否有"暂无导出数据"或类似的提示
+    返回：True 表示有无数据提示
+    """
+    try:
+        # 常见的无数据提示文本
+        no_data_messages = [
+            "暂无导出数据",
+            "暂无数据",
+            "无导出数据",
+            "没有数据",
+            "无数据可导出",
+            "暂无可导出数据",
+            "no data",
+            "No Data",
+            "No data to export",
+            "暂无记录",
+            "暂无",
+        ]
+        
+        # 尝试获取模态框的文本内容
+        try:
+            modal_text = await modal.inner_text()
+            modal_text = modal_text.strip()
+            
+            # 输出模态框全文用于调试
+            print(f"[NO-DATA-DEBUG] 模态框文本内容: '{modal_text[:200]}'")  # 只显示前200字符
+            
+            # 检查是否包含无数据提示
+            for msg in no_data_messages:
+                if msg in modal_text:
+                    print(f"[NO-DATA] ✓ 检测到提示：'{msg}'")
+                    return True
+            
+            print(f"[NO-DATA-DEBUG] 未匹配到任何无数据关键词")
+        except Exception as e:
+            print(f"[NO-DATA-DEBUG] 获取模态框文本失败: {e}")
+            pass
+        
+        # 尝试查找特定的提示元素（通常是红色提示框）
+        no_data_selectors = [
+            ".el-message-box__message:has-text('暂无')",
+            ".el-message-box__message:has-text('无数据')",
+            ".el-message-box__content:has-text('暂无')",
+            ".el-alert--error:has-text('暂无')",
+            "[class*='message']:has-text('暂无')",
+            "[class*='alert']:has-text('暂无')",
+            "[class*='tip']:has-text('暂无')",
+            "p:has-text('暂无')",
+            "div:has-text('暂无导出数据')",
+        ]
+        
+        for selector in no_data_selectors:
+            try:
+                elem = modal.locator(selector)
+                if await elem.count() > 0:
+                    text = await elem.first.inner_text()
+                    print(f"[NO-DATA] ✓ 找到提示元素：'{text.strip()}' (选择器: {selector})")
+                    return True
+            except Exception:
+                continue
+        
+        print(f"[NO-DATA-DEBUG] 未检测到无数据提示")
+        return False
+        
+    except Exception as e:
+        print(f"[NO-DATA] 检测提示时出错: {e}")
+        return False
+
+async def _close_modal_without_download(modal) -> bool:
+    """
+    关闭无数据的模态框（优先点击"取消"按钮）
+    返回：是否成功关闭
+    """
+    try:
+        # 优先级1：取消/关闭按钮（底部操作按钮）
+        cancel_button_selectors = [
+            # Element Plus 的取消按钮
+            ".el-message-box__btns button:has-text('取消')",
+            ".el-dialog__footer button:has-text('取消')",
+            # VXE 的取消按钮
+            ".vxe-modal--footer button:has-text('取消')",
+            "button:has-text('取消导出')",
+            # 通用取消按钮
+            "button:has-text('取消')",
+            "button:has-text('关闭')",
+            "button:has-text('Cancel')",
+            "button:has-text('Close')",
+            # 通过类名查找非主要按钮（通常是取消按钮）
+            ".el-message-box__btns .el-button:not(.el-button--primary)",
+            ".el-dialog__footer .el-button:not(.el-button--primary)",
+            ".vxe-modal--footer .vxe-button:not(.theme--primary)",
+            ".ant-modal-footer .ant-btn:not(.ant-btn-primary)",
+        ]
+        
+        print(f"[MODAL-CLOSE-DEBUG] 开始查找取消按钮...")
+        for i, selector in enumerate(cancel_button_selectors):
+            try:
+                btn = modal.locator(selector)
+                count = await btn.count()
+                print(f"[MODAL-CLOSE-DEBUG] 选择器 {i+1}/{len(cancel_button_selectors)}: {selector} - 找到 {count} 个元素")
+                if count > 0:
+                    # 获取按钮文本用于确认
+                    try:
+                        btn_text = await btn.first.inner_text()
+                        print(f"[MODAL-CLOSE] 找到取消按钮: '{btn_text.strip()}' (选择器: {selector})")
+                    except:
+                        print(f"[MODAL-CLOSE] 找到取消按钮 (选择器: {selector})")
+                    
+                    await btn.first.click()
+                    await asyncio.sleep(0.3)  # 等待模态框关闭
+                    return True
+            except Exception as e:
+                print(f"[MODAL-CLOSE-DEBUG] 选择器失败: {e}")
+                continue
+        
+        # 优先级2：通用页脚按钮组中选"非主按钮"作为取消（VXE/Element/AntD）
+        footer_groups = [
+            ".vxe-modal--footer .vxe-button",
+            ".vxe-modal--footer button",
+            ".el-dialog__footer .el-button",
+            ".el-message-box__btns .el-button",
+            ".ant-modal-footer .ant-btn"
+        ]
+        for group_sel in footer_groups:
+            try:
+                group = modal.locator(group_sel)
+                cnt = await group.count()
+                if cnt:
+                    print(f"[MODAL-CLOSE-DEBUG] 页脚按钮组 {group_sel} 有 {cnt} 个按钮")
+                    # 先找非主按钮
+                    try:
+                        non_primary_sel = f"{group_sel}:not(.theme--primary):not(.el-button--primary):not(.ant-btn-primary)"
+                        non_primary = modal.locator(non_primary_sel)
+                        non_primary_cnt = await non_primary.count()
+                        if non_primary_cnt:
+                            print(f"[MODAL-CLOSE] 通过页脚非主按钮关闭: {group_sel}")
+                            await non_primary.first.click()
+                            await asyncio.sleep(0.3)
+                            return True
+                    except Exception:
+                        pass
+                    # 兜底：VXE等页脚左侧第一个通常就是取消
+                    if cnt >= 1:
+                        print(f"[MODAL-CLOSE] 页脚按钮组点击第一个（通常是取消）: {group_sel}")
+                        with contextlib.suppress(Exception):
+                            await group.first.click()
+                            await asyncio.sleep(0.3)
+                            return True
+            except Exception:
+                continue
+
+        # 优先级3：X 关闭按钮（右上角）
+        close_x_selectors = [
+            ".el-message-box__headerbtn .el-message-box__close",
+            ".el-dialog__headerbtn .el-dialog__close",
+            ".vxe-modal--close-btn",
+            ".ant-modal-close",
+            "[class*='close'][class*='btn']",
+        ]
+        
+        print(f"[MODAL-CLOSE-DEBUG] 未找到取消按钮，尝试查找X关闭按钮...")
+        for selector in close_x_selectors:
+            try:
+                btn = modal.locator(selector)
+                if await btn.count() > 0:
+                    print(f"[MODAL-CLOSE] 找到X关闭按钮: {selector}")
+                    await btn.first.click()
+                    await asyncio.sleep(0.3)
+                    return True
+            except Exception:
+                continue
+        
+        # 优先级4：尝试按 ESC 键关闭（最后手段）
+        print(f"[MODAL-CLOSE-DEBUG] 未找到任何关闭按钮，尝试按ESC键...")
+        try:
+            pg = page_of(modal)
+            await pg.keyboard.press("Escape")
+            await asyncio.sleep(0.3)
+            print(f"[MODAL-CLOSE] 已按 ESC 键关闭")
+            return True
+        except Exception:
+            pass
+        
+        print(f"[MODAL-CLOSE] 未找到任何关闭方式")
+        return False
+        
+    except Exception as e:
+        print(f"[MODAL-CLOSE] 关闭模态框出错: {e}")
+        return False
+
+async def _wait_no_data_toast(scope, timeout_ms: int = 2000) -> bool:
+    """在给定时间内等待全局'暂无导出数据'提示出现。出现则返回 True。"""
+    pg = page_of(scope)
+    end = (timeout_ms or 0) / 1000.0
+    step = 0.12
+    elapsed = 0.0
+    while elapsed <= end:
+        if await _detect_global_no_data(scope):
+            return True
+        try:
+            await pg.wait_for_timeout(int(step * 1000))
+        except Exception:
+            pass
+        elapsed += step
+    return False
+
+async def _wait_download_or_toast(scope, timeout_ms: int = 8000):
+    """等待下载事件或无数据toast，二者其一先发生。
+    返回 (kind, value): kind in { 'download', 'toast', 'timeout' }
+    """
+    pg = page_of(scope)
+    task_dl = asyncio.create_task(pg.wait_for_event("download"))
+    try:
+        toast = asyncio.create_task(_wait_no_data_toast(scope, timeout_ms=min(2000, timeout_ms)))
+        done, pending = await asyncio.wait({task_dl, toast}, timeout=(timeout_ms or 0)/1000.0, return_when=asyncio.FIRST_COMPLETED)
+        if toast in done and await toast:
+            # 发现无数据toast
+            with contextlib.suppress(Exception):
+                task_dl.cancel()
+            return ("toast", None)
+        if task_dl in done:
+            try:
+                dl = task_dl.result()
+                return ("download", dl)
+            except Exception:
+                pass
+        # 超时或都未完成
+        with contextlib.suppress(Exception):
+            task_dl.cancel()
+        return ("timeout", None)
+    finally:
+        for t in [task_dl, 'toast']:
+            pass
+
+async def click_modal_confirm(modal, confirm_rx: re.Pattern, timeout_download=8000):
+    """点击确认按钮，使用 expect_download() 安全等待下载，防止页面关闭错误。"""
+    pg = page_of(modal)
+    
+    # 宽松匹配常见确认文案
+    confirm_text_rx = re.compile(r"(导出|确定|下载|Export|OK|Confirm|CSV|Excel|导出数据)", re.I)
+    
+    cands = [
+        modal.locator(".vxe-modal--footer button, .vxe-button"),
+        modal.locator(".el-message-box__btns button, .el-dialog__footer button, .el-button"),
+        modal.locator(".ant-modal-footer button, .ant-btn"),
+        modal.locator("button, .el-button, .vxe-button, .ant-btn")
+    ]
+    
+    async def _click_and_wait_safe(button):
+        """点击按钮并安全等待下载，即使页面关闭也能捕获下载对象"""
+        try:
+            # 使用 expect_download() 可以在点击前就准备好监听器，防止页面关闭导致下载丢失
+            async with pg.expect_download(timeout=timeout_download) as dl_info:
+                await button.click()
+            # 成功捕获到下载
+            print(f"[INFO] 成功捕获下载对象")
+            return await dl_info.value
+        except Exception as e:
+            # 检查是否是"暂无数据"toast
+            try:
+                if await _detect_global_no_data(modal):
+                    print("[INFO] 检测到'暂无导出数据'提示，关闭模态框")
+                    with contextlib.suppress(Exception):
+                        await _close_modal_without_download(modal)
+                    return None
+            except Exception:
+                pass
+            # 其他异常（超时、页面关闭等）- 按ESC关闭模态框
+            print(f"[WARN] 等待下载时异常: {e}")
+            print(f"[INFO] 尝试按ESC键关闭模态框...")
+            try:
+                await pg.keyboard.press("Escape")
+                await asyncio.sleep(0.5)
+                print(f"[INFO] 已按ESC键关闭模态框")
+            except Exception as esc_err:
+                print(f"[WARN] 按ESC键失败: {esc_err}")
+                # 尝试点击取消按钮
+                with contextlib.suppress(Exception):
+                    await _close_modal_without_download(modal)
+            return None
+    
+    # 1) 先按文案找确认按钮
+    for loc in cands:
+        try:
+            cnt = await loc.count()
+        except Exception:
+            continue
+        for i in range(cnt):
+            try:
+                b = loc.nth(i)
+                txt = (await b.inner_text()).strip()
+                if confirm_text_rx.search(txt):
+                    print(f"[INFO] 找到确认按钮: '{txt}'，点击并等待下载...")
+                    dl = await _click_and_wait_safe(b)
+                    if dl:
+                        return dl
+            except Exception:
+                continue
+    
+    # 2) 再点主按钮
+    try:
+        primary = modal.locator(".vxe-button.theme--primary, .el-button--primary, .ant-btn-primary")
+        if await primary.count():
+            print(f"[INFO] 尝试点击主按钮...")
+            dl = await _click_and_wait_safe(primary.first)
+            if dl:
+                return dl
+    except Exception:
+        pass
+    
+    # 3) 兜底：点第一个可见按钮
+    try:
+        anybtn = modal.locator("button, .el-button, .vxe-button, .ant-btn")
+        if await anybtn.count():
+            print(f"[INFO] 兜底：点击第一个可见按钮...")
+            dl = await _click_and_wait_safe(anybtn.first)
+            if dl:
+                return dl
+    except Exception:
+        pass
+    
+    return None
+
+async def click_export_and_download(scope, export_rx: re.Pattern, confirm_rx: re.Pattern, target_path: Path, shotdir: Path, timeout_modal: int = 8000, timeout_no_modal: int = 6000) -> bool:
+    """无论是否产生文件，都不能抛异常；无文件就 False 让上层跳过。
+    
+    Args:
+        timeout_modal: 有弹窗时的下载超时时间（毫秒），默认8秒
+        timeout_no_modal: 无弹窗时的下载超时时间（毫秒），默认6秒
+    """
+    pg = page_of(scope)
+    btns = scope.get_by_role("button", name=export_rx)
+    if not await btns.count():
+        btns = scope.locator("button, .el-button, .vxe-button").filter(has_text=export_rx)
+    if not await btns.count():
+        btns = scope.locator("a").filter(has_text=export_rx)
+    if not await btns.count():
+        await snapshot(scope, "no_export_button", shotdir); return False
+
+    try:
+        await btns.first.scroll_into_view_if_needed()
+        await btns.first.click()
+    except Exception:
+        with contextlib.suppress(Exception): await btns.first.click(force=True)
+    
+    # 导出按钮点击后，部分系统会立即以"toast"方式提示"暂无导出数据"且弹窗仍保持"导出数据"表单
+    # 在对话框确认前再快速检查一次全局无数据提示，避免进入长时间的下载等待
+    try:
+        if await _detect_global_no_data(scope):
+            modal_probe = await wait_any_modal(scope, timeout=500)
+            if modal_probe is not None:
+                with contextlib.suppress(Exception):
+                    await _close_modal_without_download(modal_probe)
+            return False
+    except Exception:
+        pass
+
+    # 先快速检查是否存在全局"暂无导出数据"提示（红色toast等）
+    try:
+        if await _detect_global_no_data(scope):
+            # 若此时也出现了导出对话框，一并关闭（点击取消）
+            modal_probe = await wait_any_modal(scope, timeout=500)
+            if modal_probe is not None:
+                with contextlib.suppress(Exception):
+                    await _close_modal_without_download(modal_probe)
+            return False
+    except Exception:
+        pass
+
+    # 1) 有弹窗：点确定→期待下载；无下载则视作空集
+    modal = await wait_any_modal(scope, timeout=2000)
+    if modal is not None:
+        try:
+            # 先检查是否有"暂无导出数据"或类似提示
+            has_no_data = await _check_no_data_message(modal)
+            
+            if has_no_data:
+                # 检测到无数据提示，直接点击取消
+                await snapshot(scope, "modal_no_data_detected", shotdir)
+                print(f"[INFO] 检测到'暂无导出数据'提示，点击取消按钮")
+                
+                closed = await _close_modal_without_download(modal)
+                if closed:
+                    print(f"[INFO] 已点击取消，关闭无数据模态框")
+                else:
+                    print(f"[WARN] 未能关闭模态框")
+                
+                return False
+            
+            # 没有无数据提示，正常点击确认并等待下载
+            dl = await click_modal_confirm(modal, confirm_rx, timeout_download=timeout_modal)
+            if dl:
+                # 用服务端建议名取后缀，若无则回退.csv；统一保存到脚本同级 downloads/
+                suggested = (dl.suggested_filename or "").strip()
+                ext = Path(suggested).suffix or Path(target_path).suffix or ".csv"
+                
+                # 固定保存到 scripts/downloads/ 目录
+                downloads_dir = (Path(__file__).parent / "downloads").resolve()
+                final_path = (downloads_dir / Path(target_path).name).with_suffix(ext)
+                final_path.parent.mkdir(parents=True, exist_ok=True)
+                
+                print(f"[FILE-SAVE] 建议文件名: {suggested or 'N/A'}")
+                print(f"[FILE-SAVE] 最终路径: {final_path.resolve()}")
+                
+                await dl.save_as(str(final_path))
+                
+                if final_path.exists() and final_path.stat().st_size > 0:
+                    print(f"[✓ DL] {final_path.resolve()} ({final_path.stat().st_size} bytes)")
+                    return True
+                else:
+                    print(f"[WARN] 下载文件为空或不存在: {final_path.resolve()}")
+                    await snapshot(scope, "modal_download_failed", shotdir)
+                    return False
+            
+            # 点击了确认但无下载，关闭模态框
+            await snapshot(scope, "modal_no_download", shotdir)
+            print(f"[INFO] 无数据下载，准备关闭模态框")
+            
+            closed = await _close_modal_without_download(modal)
+            if closed:
+                print(f"[INFO] 已关闭无数据模态框，继续下一个")
+            else:
+                print(f"[WARN] 未能关闭模态框，可能需要手动关闭")
+            
+            return False
+        except Exception as e:
+            await snapshot(scope, "modal_confirm_error", shotdir)
+            print(f"[WARN] 模态框处理异常: {e}")
+            # 尝试关闭模态框
+            with contextlib.suppress(Exception):
+                await _close_modal_without_download(modal)
+            return False
+
+    # 2) 无弹窗：直接期待下载
+    try:
+        async with pg.expect_download(timeout=timeout_no_modal) as dlfut:
+            await btns.first.click()
+        dl = await dlfut.value
+        
+        # 用服务端建议名取后缀，若无则回退.csv；统一保存到脚本同级 downloads/
+        suggested = (dl.suggested_filename or "").strip()
+        ext = Path(suggested).suffix or Path(target_path).suffix or ".csv"
+        
+        # 固定保存到 scripts/downloads/ 目录
+        downloads_dir = (Path(__file__).parent / "downloads").resolve()
+        final_path = (downloads_dir / Path(target_path).name).with_suffix(ext)
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        print(f"[FILE-SAVE] 建议文件名: {suggested or 'N/A'}")
+        print(f"[FILE-SAVE] 最终路径: {final_path.resolve()}")
+        
+        await dl.save_as(str(final_path))
+        
+        if final_path.exists() and final_path.stat().st_size > 0:
+            print(f"[✓ DL] {final_path.resolve()} ({final_path.stat().st_size} bytes)")
+            return True
+        else:
+            print(f"[WARN] 下载文件为空或不存在: {final_path.resolve()}")
+            return False
+    except Exception as e:
+        print(f"[WARN] 无弹窗下载失败: {e}")
+        await snapshot(scope, "xhr_or_no_download", shotdir)
+        await asyncio.sleep(0.12)
+        return False
+
+# ---------- Run ----------
+async def run(args):
+    cfg = json.loads(Path(args.config).read_text(encoding="utf-8"))
+    base = cfg["base_origin"].rstrip("/")
+    shotdir = Path("_shots"); shotdir.mkdir(exist_ok=True)
+
+    export_rx = re.compile(cfg["buttons"]["export_any_regex"])
+    confirm_rx = re.compile(cfg["buttons"]["confirm_any_regex"])
+    strategies = cfg.get("date_open_strategy", [])
+    menus = cfg["menus"]
+    menu_modes = cfg.get("menu_modes", {})
+    manual_targets = cfg.get("manual_platform_targets", [])
+    skip_targets = set(cfg.get("skip_platform_targets", []))
+    plat_idx = cfg.get("selectors",{}).get("platform_select_index", 0)
+    frame_selector = cfg.get("frame_selector","")
+    login_once = {"done": False}
+    
+    # 获取盘口名称，用于文件命名（增强：如果配置缺失，从域名自动提取）
+    from urllib.parse import urlparse
+    
+    site_name_cfg = cfg.get("site_name", "").strip()
+    site_name = site_name_cfg
+    
+    # 如果配置中没有 site_name，尝试从域名提取
+    if not site_name:
+        try:
+            host = urlparse(base).hostname or ""
+            # 例如 mygamemxvip.com -> 提取 mxvip
+            m = re.search(r"mygame([a-z0-9]+)", host, re.I)
+            if m:
+                site_name = m.group(1).lower()
+                print(f"[SITE] 从域名自动提取盘口名称：{site_name}")
+        except Exception:
+            pass
+    
+    if site_name:
+        print(f"[SITE] 盘口名称：{site_name}")
+    else:
+        print("[WARN] 未能识别盘口名称，文件名将不带盘口前缀")
+    
+    # 自动模式：默认为True，除非用户指定了 --manual
+    auto_mode = not getattr(args, 'manual', False)
+    print(f"[MODE] {'自动' if auto_mode else '手动'}选择平台模式")
+
+    # Force route mapping: 从配置文件读取路由映射，方便切换不同网站
+    # 如果 config.json 中没有配置 force_routes，则使用空字典（完全依赖菜单导航）
+    FORCE_ROUTE = cfg.get("force_routes", {})
+    
+    # 超时配置：从配置文件读取，如果没有则使用默认值
+    timeouts = cfg.get("timeouts", {})
+    timeout_modal = timeouts.get("download_with_modal", 8000)
+    timeout_no_modal = timeouts.get("download_no_modal", 6000)
+
+    async with async_playwright() as pw:
+        # 强制使用非无头模式，并优化加载速度
+        browser = await pw.chromium.launch(
+            headless=False,  # 强制可见模式
+            args=[
+                '--start-maximized',  # 最大化窗口
+                '--disable-blink-features=AutomationControlled',  # 隐藏自动化特征
+                '--disable-dev-shm-usage',  # 避免共享内存问题
+                '--no-sandbox',  # 禁用沙箱（加快启动）
+                '--disable-setuid-sandbox',
+                '--disable-web-security',  # 禁用跨域检查（加速）
+                '--disable-features=IsolateOrigins,site-per-process',
+                '--disable-site-isolation-trials',
+                '--disable-features=BlockInsecurePrivateNetworkRequests',  # 加速网络请求
+                '--aggressive-cache-discard',
+                '--disable-cache',
+                '--disable-application-cache',
+                '--disable-offline-load-stale-cache',
+                '--disk-cache-size=0',
+                '--disable-gpu-shader-disk-cache',
+                '--media-cache-size=0',
+                '--disable-extensions',  # 禁用扩展
+                '--disable-component-extensions-with-background-pages',
+            ],
+            timeout=60000  # 60秒浏览器启动超时
+        )
+        
+        # 固定下载目录到脚本同级 downloads/
+        import os
+        downloads_dir = (Path(__file__).parent / "downloads").resolve()
+        downloads_dir.mkdir(parents=True, exist_ok=True)
+        
+        print(f"[浏览器] 正在创建浏览器上下文...")
+        ctx: BrowserContext = await browser.new_context(
+            accept_downloads=True,
+            viewport=None,  # 使用完整窗口大小
+            ignore_https_errors=True  # 忽略SSL错误（加速）
+        )
+        print(f"[浏览器] 正在打开新页面...")
+        page: Page = await ctx.new_page()
+        print(f"[浏览器] 浏览器已就绪，准备导航...")
+        
+        print(f"[CWD] 当前工作目录: {os.getcwd()}")
+        print(f"[DOWNLOADS] 下载目录: {downloads_dir}")
+        print(f"[SCRIPT] 脚本位置: {Path(__file__).parent.resolve()}")
+        
+        try:
+            # 强化初始导航的鲁棒性与超时
+            with contextlib.suppress(Exception):
+                ctx.set_default_navigation_timeout(120000)
+                ctx.set_default_timeout(60000)
+            # 智能URL选择：如果base包含需要登录的页面（如AdminList），先尝试登录页
+            nav_urls = []
+            if "#/" in base:
+                origin = base.split("#/")[0]
+                # 优先尝试登录页
+                nav_urls.append(origin + "#/login")
+                # 然后尝试原始URL
+                nav_urls.append(base)
+            else:
+                nav_urls.append(base)
+            
+            nav_attempts = 3
+            nav_success = False
+            for nav_try in range(nav_attempts):
+                # 第一次尝试用登录页，后续尝试用原始URL
+                target_url = nav_urls[0] if nav_try == 0 and len(nav_urls) > 1 else base
+                
+                try:
+                    print(f"[NAV] goto {target_url} (try {nav_try+1}/{nav_attempts})")
+                    print(f"[NAV] 正在加载页面，请稍候...")
+                    
+                    # 尝试访问，使用更激进的等待策略以加快速度
+                    # 先用 commit（最快），如果失败再用 domcontentloaded
+                    try:
+                        response = await page.goto(target_url, wait_until="commit", timeout=30000)
+                        print(f"[NAV] 页面开始加载（commit）")
+                    except Exception:
+                        # commit 失败，尝试 domcontentloaded
+                        response = await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+                    
+                    # 检查是否成功加载
+                    if response:
+                        print(f"[NAV] 页面加载成功，状态码: {response.status}")
+                        print(f"[NAV] 当前URL: {page.url}")
+                    
+                    # 不等待 networkidle（太慢），直接继续
+                    # 等待页面稳定（缩短时间）
+                    with contextlib.suppress(Exception):
+                        await page.wait_for_load_state("domcontentloaded", timeout=5000)
+                    
+                    # 给页面一点时间渲染基本元素
+                    await asyncio.sleep(1)
+                    
+                    # 如果被重定向到登录页面，这是正常的
+                    if "login" in page.url.lower():
+                        print(f"[NAV] 检测到登录页面，这是正常的，稍后会提示登录")
+                    
+                    nav_success = True
+                    break
+                except Exception as e:
+                    error_msg = str(e)
+                    print(f"[NAV] goto timeout/error: {error_msg}")
+                    await snapshot(page, f"goto_error_try{nav_try+1}", shotdir)
+                    
+                    # 网络诊断
+                    if "net::" in error_msg.lower() or "timeout" in error_msg.lower():
+                        print(f"[ERROR] 网络连接问题诊断：")
+                        print(f"  • 错误类型: {'网络超时' if 'timeout' in error_msg.lower() else '网络错误'}")
+                        print(f"  • 目标地址: {base}")
+                        print(f"  • 可能原因:")
+                        print(f"    1. 网站服务器暂时不可用")
+                        print(f"    2. 需要VPN或特殊网络环境")
+                        print(f"    3. 防火墙拦截")
+                        print(f"    4. DNS解析失败")
+                        print(f"  • 建议:")
+                        print(f"    1. 在普通浏览器中手动打开: {base}")
+                        print(f"    2. 检查网络连接")
+                        print(f"    3. 如果需要VPN，请先连接VPN")
+                    
+                    # 如果页面或上下文已被关闭，且不是最后一次尝试，重建一次再重试
+                    if "Target page, context or browser has been closed" in error_msg and nav_try < nav_attempts - 1:
+                        print(f"[NAV] 检测到页面关闭，重新创建浏览器上下文...")
+                        with contextlib.suppress(Exception):
+                            await page.close()
+                            await ctx.close()
+                        ctx = await browser.new_context(
+                            accept_downloads=True,
+                            viewport=None
+                        )
+                        page = await ctx.new_page()
+                        with contextlib.suppress(Exception):
+                            ctx.set_default_navigation_timeout(120000)
+                            ctx.set_default_timeout(60000)
+                        print(f"[NAV] 浏览器上下文已重建，继续尝试...")
+                    if nav_try == nav_attempts - 1:
+                        print(f"[ERROR] 所有导航尝试均失败，请检查：")
+                        print(f"  1. 网站地址是否正确: {base}")
+                        print(f"  2. 网络连接是否正常")
+                        print(f"  3. 是否需要VPN或特殊网络环境")
+                        print(f"  4. 尝试在浏览器手动访问登录页: {origin}#/login" if "#/" in base else base)
+                        raise
+                    await asyncio.sleep(3)
+            
+            if not nav_success:
+                print(f"[ERROR] 导航失败，无法继续")
+                raise Exception("导航失败")
+            await wait_login_pause(page, shotdir, once_flag=login_once)
+            scope = get_scope(page, frame_selector)
+
+            async def before_each_task(menu_key: str) -> bool:
+                # Hard route first if configured
+                try:
+                    expected = FORCE_ROUTE.get(menu_key)
+                    if expected:
+                        cur = page.url
+                        base_no_hash = cur.split("#")[0] if "#" in cur else base.split("#")[0]
+                        target_url = base_no_hash + expected
+                        if target_url != cur:
+                            print(f"[ROUTE] Force redirect → {target_url}")
+                            await page.goto(target_url)
+                            # 记录当前 URL，帮助排查
+                            print(f"[ROUTE] Current URL: {page.url}")
+                            await snapshot(page, f"route_{menu_key}", shotdir)
+                        # 刷新后重建 scope（iframe 可能变化）
+                        nonlocal scope
+                        scope = get_scope(page, frame_selector)
+                        return True
+                except Exception as e:
+                    print(f"[ROUTE] Force route error: {e}, fallback to menu click")
+
+                # Fallback to menu clicking
+                ok = await goto_by_menu(scope, menus[menu_key], shotdir)
+                if ok:
+                    print(f"[ROUTE] Menu click completed, current URL: {page.url}")
+                return ok
+
+            async def do_month_exports(tag_prefix: str):
+                for label in ["本月","上月"]:
+                    try:
+                        if not await open_date_panel(scope, strategies, shotdir):
+                            print(f"[SKIP] {tag_prefix} {label} 无法打开日期面板，跳过该月份。")
+                            continue
+                        if not await pick_quick_or_type(scope, label, shotdir):
+                            print(f"[SKIP] {tag_prefix} {label} 无法选择日期，跳过该月份。")
+                            continue
+                        await click_query(scope); await wait_table_loaded(scope)
+                        tag = dt.datetime.now().strftime("%Y-%m-%d")
+                        # 在文件名中添加盘口名
+                        filename = f"{site_name}_{tag_prefix}_{label}_{tag}.csv" if site_name else f"{tag_prefix}_{label}_{tag}.csv"
+                        downloads_dir = Path("downloads"); downloads_dir.mkdir(parents=True, exist_ok=True)
+                        target = downloads_dir / sanitize_filename(filename)
+                        ok = await click_export_and_download(scope, export_rx, confirm_rx, target, shotdir, timeout_modal, timeout_no_modal)
+                        if not ok:
+                            print(f"[SKIP] {tag_prefix} {label} 无文件/空结果，已跳过。")
+                    except Exception as e:
+                        print(f"[ERROR] {tag_prefix} {label} 导出失败: {e}，继续下一月份。")
+                        continue
+
+            async def do_yesterday_exports_multi(buttons_key: str, prefix: str):
+                try:
+                    if not await open_date_panel(scope, strategies, shotdir):
+                        print(f"[SKIP] {prefix} 无法打开日期面板，跳过该任务。")
+                        return
+                    if not await pick_quick_or_type(scope, "昨天", shotdir):
+                        print(f"[SKIP] {prefix} 无法选择昨天日期，跳过该任务。")
+                        return
+                    await click_query(scope); await wait_table_loaded(scope)
+                    tag = dt.datetime.now().strftime("%Y-%m-%d")
+                    for item in cfg["buttons"][buttons_key]:
+                        try:
+                            rx = re.compile(item["text_regex"])
+                            fname = item["filename"].format(date=tag)
+                            # 在文件名中添加盘口名
+                            filename = f"{site_name}_{prefix}_{fname}" if site_name else f"{prefix}_{fname}"
+                            downloads_dir = Path("downloads"); downloads_dir.mkdir(parents=True, exist_ok=True)
+                            target = downloads_dir / sanitize_filename(filename)
+                            ok = await click_export_and_download(scope, rx, confirm_rx, target, shotdir, timeout_modal, timeout_no_modal)
+                            if not ok:
+                                print(f"[SKIP] {prefix} {item['text_regex']} 无文件/空结果，已跳过。")
+                        except Exception as e:
+                            print(f"[ERROR] {prefix} {item.get('text_regex', '未知')} 导出失败: {e}，继续下一项。")
+                            continue
+                except Exception as e:
+                    print(f"[ERROR] {prefix} 昨天数据导出失败: {e}")
+
+            async def do_last_n_days_exports_multi(buttons_key: str, prefix: str, days: int = 15):
+                """逐日导出最近 N 天数据（每一天单独查询与导出）。"""
+                try:
+                    base_day = dt.date.today()
+                    # 从最近到较早，或按需求可反向；这里按由早到近，便于观察进度
+                    for offset in range(days - 1, -1, -1):
+                        the_day = base_day - dt.timedelta(days=offset)
+                        day_str = the_day.strftime("%Y-%m-%d")
+
+                        # 打开日期面板并输入同一天的起止
+                        if not await open_date_panel(scope, strategies, shotdir):
+                            print(f"[SKIP] {prefix} 无法打开日期面板（{day_str}），跳过该日。")
+                            continue
+                        if not await type_range(scope, day_str, day_str):
+                            print(f"[SKIP] {prefix} 无法设置日期为 {day_str}，跳过该日。")
+                            continue
+
+                        await click_query(scope)
+                        await wait_table_loaded(scope)
+
+                        for item in cfg["buttons"].get(buttons_key, []):
+                            try:
+                                rx = re.compile(item["text_regex"])
+                                fname = item["filename"].format(date=day_str)
+                                filename = f"{site_name}_{prefix}_{fname}" if site_name else f"{prefix}_{fname}"
+                                downloads_dir = Path("downloads"); downloads_dir.mkdir(parents=True, exist_ok=True)
+                                target = downloads_dir / sanitize_filename(filename)
+                                ok = await click_export_and_download(scope, rx, confirm_rx, target, shotdir, timeout_modal, timeout_no_modal)
+                                if not ok:
+                                    print(f"[SKIP] {prefix} {item['text_regex']} {day_str} 无文件/空结果，已跳过。")
+                            except Exception as e:
+                                print(f"[ERROR] {prefix} {item.get('text_regex','未知')} {day_str} 导出失败: {e}，继续下一项。")
+                                continue
+                except Exception as e:
+                    print(f"[ERROR] {prefix} 最近{days}天数据导出失败: {e}")
+
+            # -------- tasks --------
+            async def task_ops():
+                if not await before_each_task("ops"): return
+                await do_month_exports("download_ops_默认")
+
+            async def task_retention_data(key):
+                """处理留存率数据 - 需要分渠道处理"""
+                if not await before_each_task(key): return
+                print(f"[INFO] Start {key} data crawling (channel processing)")
+                print(f"[INFO] 待处理平台列表：{manual_targets} (共{len(manual_targets)}个)")
+                
+                for idx, target in enumerate(manual_targets, 1):
+                    print(f"[PLATFORM] 开始处理第 {idx}/{len(manual_targets)} 个平台: {target}")
+                    if target in skip_targets:
+                        print(f"[SKIP] Skip platform by rule: {target}")
+                        continue
+                    
+                    # 增加页面稳定性检查
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=10000)
+                    except Exception:
+                        print(f"[WARN] Page not stable, continue anyway")
+                    
+                    # 平台选择：为避免选择错误的下拉框，尝试多个索引（模仿首充复登成功逻辑）
+                    # 优先使用配置中的特定索引，其次回退尝试 0/1/2
+                    per_task_indices = cfg.get("per_task_platform_indices", {}).get(key, [])
+                    candidate_indices = []
+                    if isinstance(per_task_indices, list):
+                        candidate_indices.extend(per_task_indices)
+                    candidate_indices.extend([plat_idx, 0, 1, 2])
+                    # 去重保序
+                    seen = set(); candidate_indices = [i for i in candidate_indices if (i not in seen and not seen.add(i))]
+
+                    def _extract_id(txt: Optional[str]) -> Optional[str]:
+                        if not txt: return None
+                        m = re.match(r"(\d+)\s*\|", txt)
+                        return m.group(1) if m else None
+
+                    def _match_target(selected: Optional[str], target_text: str) -> bool:
+                        if not selected: return False
+                        s = re.sub(r"\s+", " ", selected.strip())
+                        if target_text in s or s in target_text:
+                            return True
+                        sid = _extract_id(s); tid = _extract_id(target_text)
+                        return bool(sid and tid and sid == tid)
+
+                    plat_name = None
+                    for try_idx in candidate_indices:
+                        print(f"[SELECT] 尝试下拉索引 {try_idx} 选择平台：{target}")
+                        sel = await wait_for_user_platform(scope, try_idx, target, timeout_ms=180000, auto_mode=auto_mode, clear_before_select=True)
+                        if _match_target(sel, target):
+                            plat_name = sel
+                            print(f"[OK] 平台选择成功（索引 {try_idx}）：{plat_name}")
+                            break
+                        else:
+                            if sel:
+                                print(f"[WARN] 平台选择未匹配（索引 {try_idx}）：实际={sel} 期望包含/同ID={target}")
+                            else:
+                                print(f"[WARN] 索引 {try_idx} 未读到已选平台，继续尝试...")
+                            await asyncio.sleep(0.4)
+
+                    if not plat_name:
+                        print(f"[SKIP] No platform selected after trying indices {candidate_indices}: {target}")
+                        continue
+                    
+                    # 增加重试机制
+                    max_retries = 2
+                    for attempt in range(max_retries):
+                        try:
+                            # 根据任务类型使用不同的文件名前缀
+                            if key == "first_recharge_return":
+                                prefix = "用户留存率_首充复登"
+                            elif key == "first_recharge_recharge":
+                                prefix = "用户留存率_首充复充"
+                            else:
+                                prefix = f"download_{key}"
+                            
+                            await do_month_exports(f"{prefix}_{plat_name}")
+                            break  # 成功则跳出重试循环
+                        except Exception as e:
+                            print(f"[ERROR] Export failed (attempt {attempt + 1}/{max_retries}): {e}")
+                            if attempt < max_retries - 1:
+                                print(f"[INFO] Wait 5 seconds and retry...")
+                                await asyncio.sleep(5)
+                            else:
+                                print(f"[ERROR] Export finally failed for {target}")
+                    
+                    print(f"[PLATFORM] 平台 {target} 处理完成，继续下一个...")
+                    print("=" * 50)
+
+            async def task_ltv_with_retry():
+                """LTV任务 - 添加超时处理和重试机制"""
+                if not await before_each_task("ltv"): return
+                print("[INFO] 开始LTV数据爬取（已启用超时处理和重试机制）")
+                
+                mode = menu_modes.get("ltv", {"manual_platform": False})
+                if not mode.get("manual_platform", False):
+                    # 默认模式，直接导出
+                    await do_month_exports_with_retry("download_ltv_默认")
+                    return
+                
+                # 手动平台模式
+                print(f"[INFO] LTV待处理平台列表：{manual_targets} (共{len(manual_targets)}个)")
+                for idx, target in enumerate(manual_targets, 1):
+                    print(f"[LTV-PLATFORM] 开始处理第 {idx}/{len(manual_targets)} 个平台: {target}")
+                    if target in skip_targets:
+                        print(f"[SKIP] 按规则跳过平台：{target}")
+                        continue
+                    
+                    # 增加重试机制
+                    max_retries = 3
+                    for attempt in range(max_retries):
+                        try:
+                            print(f"[INFO] LTV平台选择尝试 {attempt + 1}/{max_retries}: {target}")
+                            
+                            # 在每次尝试前等待页面稳定
+                            if attempt > 0:
+                                print(f"[INFO] 等待页面稳定...")
+                                await asyncio.sleep(3)
+                                try:
+                                    await page.wait_for_load_state("networkidle", timeout=10000)
+                                except Exception:
+                                    pass
+                            
+                            plat_name = await wait_for_user_platform(scope, plat_idx, target, timeout_ms=180000, auto_mode=auto_mode, clear_before_select=True)
+                            if not plat_name:
+                                print(f"[WARN] 第{attempt + 1}次尝试未选择到平台：{target}")
+                                if attempt < max_retries - 1:
+                                    print(f"[INFO] 等待5秒后重试...")
+                                    await asyncio.sleep(5)
+                                    continue
+                                else:
+                                    print(f"[SKIP] 最终未选择到平台：{target}")
+                                    break
+                            
+                            # 成功选择平台，执行导出
+                            await do_month_exports_with_retry(f"download_ltv_{plat_name}")
+                            break  # 成功则跳出重试循环
+                            
+                        except Exception as e:
+                            print(f"[ERROR] LTV任务异常 (尝试 {attempt + 1}/{max_retries}): {e}")
+                            if attempt < max_retries - 1:
+                                print(f"[INFO] 等待10秒后重试...")
+                                await asyncio.sleep(10)
+                            else:
+                                print(f"[ERROR] LTV任务最终失败：{target}")
+                    
+                    print(f"[LTV-PLATFORM] 平台 {target} 处理完成，继续下一个...")
+                    print("=" * 50)
+
+            async def do_month_exports_with_retry(tag_prefix: str):
+                """带重试机制的月度导出 - 每个月份独立处理，失败不影响其他月份"""
+                for label in ["本月","上月"]:
+                    max_retries = 2
+                    success = False
+                    
+                    for attempt in range(max_retries):
+                        try:
+                            print(f"[INFO] 导出 {label} 数据 (尝试 {attempt + 1}/{max_retries}): {tag_prefix}")
+                            
+                            if not await open_date_panel(scope, strategies, shotdir):
+                                print(f"[WARN] {tag_prefix} {label} 无法打开日期面板")
+                                if attempt < max_retries - 1:
+                                    await asyncio.sleep(3)
+                                    continue
+                                else:
+                                    print(f"[SKIP] {tag_prefix} {label} 日期面板打开失败，跳过该月份。")
+                                    break
+                            
+                            if not await pick_quick_or_type(scope, label, shotdir):
+                                print(f"[WARN] {tag_prefix} {label} 无法选择日期")
+                                if attempt < max_retries - 1:
+                                    await asyncio.sleep(3)
+                                    continue
+                                else:
+                                    print(f"[SKIP] {tag_prefix} {label} 日期选择失败，跳过该月份。")
+                                    break
+                            
+                            await click_query(scope)
+                            await wait_table_loaded(scope)
+                            tag = dt.datetime.now().strftime("%Y-%m-%d")
+                            # 在文件名中添加盘口名
+                            filename = f"{site_name}_{tag_prefix}_{label}_{tag}.csv" if site_name else f"{tag_prefix}_{label}_{tag}.csv"
+                            downloads_dir = Path("downloads"); downloads_dir.mkdir(parents=True, exist_ok=True)
+                            target = downloads_dir / sanitize_filename(filename)
+                            ok = await click_export_and_download(scope, export_rx, confirm_rx, target, shotdir, timeout_modal, timeout_no_modal)
+                            
+                            if not ok:
+                                print(f"[SKIP] {tag_prefix} {label} 无文件/空结果，已跳过。")
+                            
+                            success = True
+                            break  # 成功，跳出重试循环
+                            
+                        except Exception as e:
+                            print(f"[ERROR] {tag_prefix} {label} 导出异常 (尝试 {attempt + 1}/{max_retries}): {e}")
+                            if attempt < max_retries - 1:
+                                print(f"[INFO] 等待5秒后重试...")
+                                await asyncio.sleep(5)
+                            else:
+                                print(f"[SKIP] {tag_prefix} {label} 最终失败，跳过该月份。")
+                    
+                    # 继续下一个月份，不管当前月份是否成功
+
+            async def task_A(key):
+                if not await before_each_task(key): return
+                mode = menu_modes.get(key, {"manual_platform": False})
+                if not mode.get("manual_platform", False):
+                    await do_month_exports(f"download_{key}_默认"); return
+                for target in manual_targets:
+                    if target in skip_targets:
+                        print(f"[SKIP] 按规则跳过平台：{target}")
+                        continue
+                    plat_name = await wait_for_user_platform(scope, plat_idx, target, timeout_ms=300000, auto_mode=auto_mode)
+                    if not plat_name:
+                        print(f"[SKIP] 未选择平台：{target}")
+                        continue
+                    await do_month_exports(f"download_{key}_{plat_name}")
+
+            async def task_promotion():
+                """推广渠道统计 - 查询一次，导出三次，不需要分渠道爬取"""
+                if not await before_each_task("promotion"): return
+                print("[INFO] 推广渠道统计：查询一次，导出三次")
+                # 使用原有的导出逻辑，保持原有文件名格式
+                await do_yesterday_exports_multi("promotion_buttons", "推广")
+
+            async def task_gift():
+                """赠送类型统计 - 默认全平台，选择一次即可"""
+                if not await before_each_task("gift_type"): return
+                print("[INFO] 赠送类型统计：最近15天，逐日导出")
+                # 按需逐日导出最近15天
+                await do_last_n_days_exports_multi("gift_type_buttons", "赠送类型统计", days=15)
+
+            async def task_daily_channel():
+                """每日渠道统计 - 全平台，不分渠道"""
+                if not await before_each_task("daily_channel"): return
+                print("[INFO] 每日渠道统计：全平台，不分渠道")
+                # 使用原有的导出逻辑，保持原有文件名格式
+                await do_yesterday_exports_multi("daily_channel_buttons", "每日渠道")
+
+            # schedule - 按固定顺序执行，从运营统计开始
+            requested_tasks = [x.strip() for x in args.tasks.split(",") if x.strip()]
+            
+            # 定义执行顺序：运营统计 → 首充复登 → 首充复充 → 赠送 → 推广 → 每日渠道 → LTV（最后执行）
+            execution_order = [
+                "ops",                     # 运营统计（优先执行）
+                "first_recharge_return",   # 用户留存率(首充复登)
+                "first_recharge_recharge", # 用户留存率(首充复充)
+                "gift_type",               # 赠送类型统计
+                "promotion",               # 推广渠道统计
+                "daily_channel",           # 每日渠道统计
+                "ltv"                      # LTV数据（最后执行）
+            ]
+            
+            # 按顺序执行请求的任务
+            for key in execution_order:
+                if key in requested_tasks:
+                    print(f"\n=== Start: {key} ===")
+                    if key == "ops":
+                        await task_ops()
+                    elif key in ("first_recharge_return","first_recharge_recharge"):
+                        # 留存率数据需要分渠道处理
+                        await task_retention_data(key)
+                    elif key == "ltv":
+                        # LTV数据使用带重试机制的专用函数
+                        await task_ltv_with_retry()
+                    elif key == "promotion":
+                        await task_promotion()
+                    elif key == "gift_type":
+                        await task_gift()
+                    elif key == "daily_channel":
+                        await task_daily_channel()
+                    else:
+                        print(f"[WARN] 未知任务：{key}")
+            
+            # 检查是否有未在顺序中的任务
+            for key in requested_tasks:
+                if key not in execution_order:
+                    print(f"\n=== 开始：{key} ===")
+                    print(f"[WARN] 未知任务：{key}")
+        finally:
+            keep_browser = getattr(args, 'keep_browser', False)
+            if not keep_browser:
+                with contextlib.suppress(Exception):
+                    await ctx.close()
+                with contextlib.suppress(Exception):
+                    await browser.close()
+            else:
+                print("[HOLD] 已开启 --keep-browser，浏览器保持打开状态，可手动观察或关闭。")
+
+def main():
+    p = argparse.ArgumentParser(description="VNL 导出（支持全自动平台选择）")
+    p.add_argument("--config", default="config.json", help="配置文件路径")
+    p.add_argument("--tasks", required=True, help="ops,first_recharge_return,first_recharge_recharge,ltv,promotion,gift_type,daily_channel")
+    p.add_argument("--headless", action="store_true", help="无头运行")
+    p.add_argument("--manual", action="store_true", help="手动模式：需要手动选择平台（默认为自动模式）")
+    p.add_argument("--keep-browser", action="store_true", help="任务完成后保持浏览器打开（用于调试观察）")
+    args = p.parse_args()
+    asyncio.run(run(args))
+
+if __name__ == "__main__":
+    main()
